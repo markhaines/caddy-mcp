@@ -1,0 +1,22 @@
+services:
+  caddy-mcp:
+    build: .
+    image: caddy-mcp:latest
+    container_name: caddy-mcp
+    restart: unless-stopped
+    volumes:
+      # Docker socket so we can exec into the Caddy container
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Direct access to the Caddyfile directory for fast reads/writes
+      - /docker/caddy:/caddy-config
+    ports:
+      - "8811:8000"
+    environment:
+      - CADDY_CONTAINER=caddy
+      - CADDYFILE_PATH=/caddy-config/caddyfile
+      - CADDY_CONTAINER_CONFIG=/etc/caddy/Caddyfile
+      - DOCKER_SOCKET=unix:///var/run/docker.sock
+      - MCP_API_KEY=${MCP_API_KEY}
+      - PORT=8000
+    labels:
+      - "com.docker.compose.project=caddy-mcp"

@@ -1,0 +1,4 @@
+mcp>=1.0.0
+docker>=7.0.0
+uvicorn>=0.30.0
+starlette>=0.40.0
