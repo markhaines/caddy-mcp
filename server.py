@@ -30,7 +30,6 @@ log = logging.getLogger("caddy-mcp")
 # ---------------------------------------------------------------------------
 DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "unix:///var/run/docker.sock")
 CADDY_CONTAINER = os.environ.get("CADDY_CONTAINER", "caddy")
-CADDYFILE_PATH = os.environ.get("CADDYFILE_PATH", "/caddy-config/caddyfile")
 CADDY_CONTAINER_CONFIG = os.environ.get("CADDY_CONTAINER_CONFIG", "/etc/caddy/Caddyfile")
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8000"))
@@ -143,16 +142,20 @@ async def call_tool(name: str, arguments: dict) -> list:
     try:
         # -- Read Caddyfile --------------------------------------------------
         if name == "caddy_read_config":
-            with open(CADDYFILE_PATH, "r") as f:
-                content = f.read()
+            container = get_container()
+            result = container.exec_run(["cat", CADDY_CONTAINER_CONFIG], demux=False)
+            content = result.output.decode("utf-8", errors="replace")
             return [TextContent(type="text", text=content)]
 
         # -- Write Caddyfile -------------------------------------------------
         elif name == "caddy_write_config":
             config = arguments["config"]
-            with open(CADDYFILE_PATH, "w") as f:
-                f.write(config)
-            log.info("Caddyfile written to %s", CADDYFILE_PATH)
+            container = get_container()
+            filename = os.path.basename(CADDY_CONTAINER_CONFIG)
+            directory = os.path.dirname(CADDY_CONTAINER_CONFIG)
+            tar = pack_tar(filename, config.encode("utf-8"))
+            container.put_archive(directory, tar)
+            log.info("Caddyfile written to %s in container", CADDY_CONTAINER_CONFIG)
             return [TextContent(type="text", text="✓ Caddyfile written. Call caddy_reload to apply.")]
 
         # -- Validate --------------------------------------------------------
