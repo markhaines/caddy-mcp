@@ -294,6 +294,6 @@ if __name__ == "__main__":
     log.info("Starting Caddy MCP server on port %d", PORT)
     log.info("Docker socket : %s", DOCKER_SOCKET)
     log.info("Caddy container: %s", CADDY_CONTAINER)
-    log.info("Caddyfile path : %s", CADDYFILE_PATH)
+    log.info("Caddy config   : %s", CADDY_CONTAINER_CONFIG)
     log.info("API key auth  : %s", "enabled" if MCP_API_KEY else "disabled")
     uvicorn.run(create_app(), host="0.0.0.0", port=PORT)
