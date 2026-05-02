@@ -33,6 +33,11 @@ CADDY_CONTAINER = os.environ.get("CADDY_CONTAINER", "caddy")
 CADDY_CONTAINER_CONFIG = os.environ.get("CADDY_CONTAINER_CONFIG", "/etc/caddy/Caddyfile")
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8000"))
+# Path prefix this server is mounted under by an upstream reverse proxy.
+# e.g. ROOT_PATH=/caddy means the server is reachable at https://host/caddy/sse.
+# Used so the SSE endpoint emits `/caddy/messages/...` instead of `/messages/...`,
+# which the client then POSTs back to via the same reverse proxy.
+ROOT_PATH = os.environ.get("ROOT_PATH", "").rstrip("/")
 
 docker_client = docker.DockerClient(base_url=DOCKER_SOCKET)
 server = Server("caddy-mcp")
@@ -245,7 +250,11 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
 
 def create_app() -> Starlette:
-    sse = SseServerTransport("/messages/")
+    # If the server sits behind a reverse proxy at ROOT_PATH, the SSE transport
+    # must emit endpoint URLs that include the prefix so the client POSTs back
+    # via the same proxy. The Mount path stays at /messages/ because the proxy
+    # strips ROOT_PATH before the request reaches us.
+    sse = SseServerTransport(f"{ROOT_PATH}/messages/")
 
     async def handle_sse(request: Request):
         async with sse.connect_sse(
@@ -296,4 +305,5 @@ if __name__ == "__main__":
     log.info("Caddy container: %s", CADDY_CONTAINER)
     log.info("Caddy config   : %s", CADDY_CONTAINER_CONFIG)
     log.info("API key auth  : %s", "enabled" if MCP_API_KEY else "disabled")
+    log.info("Root path     : %s", ROOT_PATH or "(none)")
     uvicorn.run(create_app(), host="0.0.0.0", port=PORT)
