@@ -234,7 +234,7 @@ async def call_tool(name: str, arguments: dict) -> list:
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if MCP_API_KEY:
+        if MCP_API_KEY and request.url.path != "/health":
             key = (
                 request.headers.get("x-api-key")
                 or request.query_params.get("api_key")
