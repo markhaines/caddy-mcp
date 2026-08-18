@@ -119,6 +119,32 @@ This server can replace the configuration of a proxy that may be fronting live s
 - Leaving `MCP_API_KEY` empty disables authentication completely. If the port is reachable beyond localhost, set a key.
 - The Docker permissions this server needs include `exec` and archive upload against the Caddy container. Prefer a scoped socket-proxy over mounting the raw socket.
 
+## Deploying an update
+
+Two different commands, two very different outcomes. The distinction matters because the compose file pins `image:` as well as `build:`.
+
+```bash
+docker compose up -d          # reuses the existing local image
+docker compose up -d --build  # rebuilds from the Dockerfile
+```
+
+A plain `up -d` recreates the containers but **reuses the `caddy-mcp:latest` image already on the host**. Changes to the Dockerfile or `requirements.txt` do not take effect. That makes it the safe option for config-only changes.
+
+Rebuilding with `--build` is the deliberate one: it is where a new base image, new dependency pins and a non-root user all take effect at once. Tag the current image as a rollback first:
+
+```bash
+docker tag caddy-mcp:latest caddy-mcp:rollback
+docker compose up -d --build
+```
+
+If the rebuild misbehaves, point `image:` at `caddy-mcp:rollback` and `up -d` again.
+
+A few things worth knowing:
+
+- Run compose commands from the directory holding the `.env` file. `MCP_API_KEY` uses the required-variable form, so `down`, `restart`, `logs` and `ps` all refuse to run without it. For a CI syntax check, `MCP_API_KEY=dummy docker compose config` is enough.
+- The socket-proxy is pinned by digest, which also pins away its security updates. Bump it deliberately rather than expecting a `pull` to do it.
+- `docker compose pull` will try to fetch the locally-built `caddy-mcp:latest` and fail. Use `--ignore-buildable` if you script a pull step.
+
 ## The Claude skill
 
 `skill/SKILL.md` is a Claude skill that describes the change workflow and a library of Caddyfile patterns (reverse proxy, internal TLS, basic auth, redirects) plus fixes for the usual 502 and reload failures. Copy it into your skills directory to have Claude follow the safe ordering by default.
