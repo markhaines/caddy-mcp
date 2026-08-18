@@ -97,6 +97,7 @@ All configuration is environment variables.
 | `MCP_API_KEY` | *(empty)* | Bearer token required on every request. Empty means auth is off. |
 | `PORT` | `8000` | Port the server listens on inside the container. |
 | `ROOT_PATH` | *(empty)* | Path prefix when mounted behind a reverse proxy, e.g. `/caddy`. |
+| `DOCKER_TIMEOUT` | `30` | Seconds allowed per Docker API round-trip. |
 
 ### Behind a reverse proxy
 
