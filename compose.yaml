@@ -2,9 +2,11 @@ services:
   # Dedicated, internal-only Docker socket-proxy for the Caddy MCP.
   # NOT published to the LAN — reachable only by caddy-mcp on the internal
   # network. Grants just what the MCP needs: read containers + exec + post
-  # (put_archive/exec_start) against the local docker.sock.
+  # (put_archive/exec_start) against the local docker.sock. EXEC + POST are
+  # root-equivalent capabilities; the real controls are network isolation and
+  # the caddy-mcp MCP_API_KEY requirement.
   socket-proxy-cm:
-    image: ghcr.io/tecnativa/docker-socket-proxy:latest
+    image: ghcr.io/tecnativa/docker-socket-proxy@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
     container_name: caddy-mcp-socket-proxy
     restart: unless-stopped
     environment:
@@ -12,6 +14,8 @@ services:
       - EXEC=1
       - POST=1
       - INFO=1
+      # caddy-mcp /health calls Docker's /_ping endpoint.
+      - PING=1
       # Required by caddy_status: container.image.tags reads /images/{id}/json.
       - IMAGES=1
       - VERSION=1
@@ -31,18 +35,20 @@ services:
       start_period: 10s
 
   caddy-mcp:
+    build: .
     image: caddy-mcp:latest
     container_name: caddy-mcp
     restart: unless-stopped
     depends_on:
-      - socket-proxy-cm
+      socket-proxy-cm:
+        condition: service_healthy
     ports:
       - "8811:8000"
     environment:
       - CADDY_CONTAINER=caddy
       - DOCKER_SOCKET=tcp://caddy-mcp-socket-proxy:2375
       - CADDY_CONTAINER_CONFIG=/etc/caddy/Caddyfile
-      - MCP_API_KEY=${MCP_API_KEY}
+      - MCP_API_KEY=${MCP_API_KEY:?MCP_API_KEY must be set}
       - PORT=8000
       - ROOT_PATH=/caddy
     networks:

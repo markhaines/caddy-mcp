@@ -2,13 +2,13 @@ FROM python:3.12.11-slim
 
 WORKDIR /app
 
+RUN addgroup --system app && adduser --system --ingroup app app
+
 # Install dependencies first (better layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
-
-RUN addgroup --system app && adduser --system --ingroup app app
 
 EXPOSE 8000
 
