@@ -5,11 +5,13 @@ Provides Claude with tools to manage a Caddy reverse proxy via the Docker API.
 Runs as a container on the same host as Caddy, using the local Docker socket.
 """
 
+import asyncio
 import hmac
 import io
 import json
 import logging
 import os
+import shlex
 import tarfile
 import threading
 import uuid
@@ -36,6 +38,11 @@ DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "unix:///var/run/docker.sock")
 CADDY_CONTAINER = os.environ.get("CADDY_CONTAINER", "caddy")
 CADDY_CONTAINER_CONFIG = os.environ.get("CADDY_CONTAINER_CONFIG", "/etc/caddy/Caddyfile")
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
+# Ceiling on every Docker API round-trip, in seconds. A write transaction is a
+# sequence of these and holds the write lock throughout, so the maximum time it
+# can occupy is an explicit property of this server rather than whatever the
+# SDK happens to default to.
+DOCKER_TIMEOUT = int(os.environ.get("DOCKER_TIMEOUT", "30"))
 PORT = int(os.environ.get("PORT", "8000"))
 # Path prefix this server is mounted under by an upstream reverse proxy.
 # e.g. ROOT_PATH=/caddy means the server is reachable at https://host/caddy/sse.
@@ -63,9 +70,16 @@ _HEX = "[0-9a-f]"
 BACKUP_SUFFIX_GLOB = (
     ".bak-" + _DIGIT * 8 + "T" + _DIGIT * 6 + "Z-" + _HEX * BACKUP_ID_CHARS
 )
-# `test -f` exits 1 for "no such file"; anything else (2, 126, 127, ...) means
-# the check itself failed and absence must not be inferred from it.
-TEST_F_ABSENT_EXIT = 1
+# What the config-type probe reports. `test -f` alone is not enough: it exits 1
+# for ANY false predicate — path is a directory, a socket, a dangling symlink —
+# and treating all of those as "absent" would write with no backup in exactly
+# the cases that most need one. The probe evaluates -f, -L and -e separately so
+# genuine absence is distinguishable from "there is something there, but it is
+# not a regular file". Any other status means the probe itself failed.
+PROBE_REGULAR_FILE = 0
+PROBE_ABSENT = 1
+PROBE_NOT_REGULAR = 3
+PROBE_DANGLING_SYMLINK = 4
 
 LOG_LINES_DEFAULT = 100
 LOG_LINES_MIN = 1
@@ -76,6 +90,14 @@ server = Server("caddy-mcp")
 _docker_client = None
 # Serialises the write transaction so two callers cannot interleave
 # backup/stage/rename against the same file.
+#
+# INVARIANT: this is process-local. It serialises writers inside ONE process,
+# which is what the current single-container deployment has. It cannot see a
+# second worker process, a second replica of this container, or anyone editing
+# the Caddyfile by hand. Running more than one writer against the same
+# Caddyfile would need an inter-process lock (a lock file on the shared mount,
+# or an advisory flock) held from the backup through to commit or rollback —
+# not implemented here, because nothing today needs it.
 _write_lock = threading.Lock()
 
 
@@ -95,7 +117,9 @@ def get_docker_client():
     """
     global _docker_client
     if _docker_client is None:
-        _docker_client = docker.DockerClient(base_url=DOCKER_SOCKET)
+        _docker_client = docker.DockerClient(
+            base_url=DOCKER_SOCKET, timeout=DOCKER_TIMEOUT
+        )
     return _docker_client
 
 
@@ -207,26 +231,56 @@ def validate_config(container, config: str) -> tuple:
             log.warning("Failed to remove validation temp file %s: %s", staged, cleanup_exc)
 
 
+def config_probe_script() -> str:
+    """Shell that classifies the config path into one PROBE_* status.
+
+    -f is checked first (it follows symlinks, so a symlink to a regular file is
+    a regular file), then -L to catch a dangling symlink, then -e for anything
+    else that exists. Only the final branch is genuine absence.
+    """
+    path = shlex.quote(CADDY_CONTAINER_CONFIG)
+    return (
+        f"if [ -f {path} ]; then exit {PROBE_REGULAR_FILE}; "
+        f"elif [ -L {path} ]; then exit {PROBE_DANGLING_SYMLINK}; "
+        f"elif [ -e {path} ]; then exit {PROBE_NOT_REGULAR}; "
+        f"else exit {PROBE_ABSENT}; fi"
+    )
+
+
 def backup_config(container) -> str:
     """Copy the live Caddyfile aside. Returns the backup path, or "" if there
-    was no existing file to back up."""
-    exists_code, exists_output = exec_in_container(
-        container, ["test", "-f", CADDY_CONTAINER_CONFIG]
+    is genuinely no file there yet.
+
+    Refuses the write for anything that is neither a regular file nor a clean
+    absence: writing unprotected is only acceptable when we have established
+    that there is nothing to protect.
+    """
+    probe_code, probe_output = exec_in_container(
+        container, ["sh", "-c", config_probe_script()]
     )
-    if exists_code == TEST_F_ABSENT_EXIT:
+    if probe_code == PROBE_ABSENT:
         log.warning(
             "No existing file at %s to back up before writing", CADDY_CONTAINER_CONFIG
         )
         return ""
-    if exists_code != 0:
-        # An exec, permission or PATH problem is not evidence of absence, and
-        # proceeding would write unprotected at exactly the wrong moment.
+    if probe_code != PROBE_REGULAR_FILE:
+        reasons = {
+            PROBE_NOT_REGULAR: (
+                "something exists at that path but it is not a regular file "
+                "(a directory, socket or device)"
+            ),
+            PROBE_DANGLING_SYMLINK: "that path is a symlink to a missing target",
+        }
+        reason = reasons.get(
+            probe_code,
+            f"the check itself failed (probe exited {probe_code}"
+            + (f": {probe_output.strip()}" if probe_output.strip() else "")
+            + ")",
+        )
         raise ToolError(
-            f"Refusing to write: could not determine whether "
-            f"{CADDY_CONTAINER_CONFIG} exists in container '{CADDY_CONTAINER}' "
-            f"(`test -f` exited {exists_code}, expected 0 or "
-            f"{TEST_F_ABSENT_EXIT}): {exists_output.strip() or '(no output)'}. "
-            f"Not writing without a backup. The live config is unchanged."
+            f"Refusing to write: {reason}, so {CADDY_CONTAINER_CONFIG} in "
+            f"container '{CADDY_CONTAINER}' cannot be backed up. Not writing "
+            f"without a backup. The live config is unchanged."
         )
 
     stamp = datetime.now(timezone.utc).strftime(BACKUP_STAMP_FORMAT)
@@ -606,7 +660,14 @@ def run_tool(name: str, arguments: dict) -> list:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list:
-    return run_tool(name, arguments)
+    # run_tool is entirely blocking — every tool makes synchronous Docker
+    # round-trips (exec, put_archive, logs, inspect). Running it inline would
+    # hold the sole event-loop thread for the whole call, so a slow or hung
+    # Docker request would stall SSE keepalives, other in-flight tool calls and
+    # /health, making the server look dead. Offload all of them; _write_lock
+    # (redundant while everything shared one thread) is what serialises the
+    # write transaction now that real threads are involved.
+    return await asyncio.to_thread(run_tool, name, arguments)
 
 
 # ---------------------------------------------------------------------------
@@ -656,12 +717,18 @@ def create_app() -> Starlette:
                 server.create_initialization_options(),
             )
 
+    def probe_docker() -> str:
+        get_docker_client().ping()
+        return get_container().status
+
     async def health(_: Request):
         try:
-            get_docker_client().ping()
-            container = get_container()
+            # Blocking Docker calls, so off the loop for the same reason as the
+            # tools: the endpoint that reports whether this container is
+            # healthy must stay answerable while a write is in flight.
+            caddy_status = await asyncio.to_thread(probe_docker)
             return Response(
-                json.dumps({"status": "ok", "caddy": container.status}),
+                json.dumps({"status": "ok", "caddy": caddy_status}),
                 media_type="application/json",
             )
         except Exception as e:
@@ -692,6 +759,7 @@ def create_app() -> Starlette:
 if __name__ == "__main__":
     log.info("Starting Caddy MCP server on port %d", PORT)
     log.info("Docker socket : %s", DOCKER_SOCKET)
+    log.info("Docker timeout: %ds", DOCKER_TIMEOUT)
     log.info("Caddy container: %s", CADDY_CONTAINER)
     log.info("Caddy config   : %s", CADDY_CONTAINER_CONFIG)
     log.info("API key auth  : %s", "enabled" if MCP_API_KEY else "disabled")

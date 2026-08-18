@@ -1,10 +1,13 @@
 """Unit tests for the Caddy MCP server. No Docker daemon required."""
 
+import asyncio
 import datetime
 import fnmatch
 import io
+import time
 import re
 import tarfile
+import threading
 
 import pytest
 from starlette.testclient import TestClient
@@ -156,7 +159,7 @@ def test_write_backs_up_then_replaces_atomically(container):
 def test_write_prunes_old_backups(container):
     server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"})
 
-    prunes = [c for c in container.exec_calls if c[0] == "sh"]
+    prunes = [c for c in container.exec_calls if c[0] == "sh" and "tail -n +" in c[-1]]
     assert len(prunes) == 1
     script = prunes[0][-1]
     assert f"tail -n +{server.BACKUP_KEEP + 1}" in script
@@ -475,16 +478,46 @@ def test_backup_names_do_not_collide_within_one_second(container, monkeypatch):
 # Round 2 — backup absence must not be inferred from an arbitrary failure
 # ---------------------------------------------------------------------------
 
-def test_write_refuses_when_the_existence_check_fails(monkeypatch):
-    stub = use(monkeypatch, StubContainer(files={CONFIG_PATH: LIVE_CONFIG.encode()}))
-    stub.fail["test"] = (127, "test: applet not found")
+@pytest.mark.parametrize(
+    "probe_status,expected_reason",
+    [
+        (server.PROBE_NOT_REGULAR, "not a regular file"),
+        (server.PROBE_DANGLING_SYMLINK, "symlink to a missing target"),
+        (127, "the check itself failed"),
+        (2, "the check itself failed"),
+    ],
+)
+def test_write_refuses_when_the_path_is_not_a_backable_regular_file(
+    monkeypatch, probe_status, expected_reason
+):
+    """`test -f` exits 1 for any false predicate, so "not a regular file" must
+    not be read as "absent" and waved through as an unprotected write."""
+    stub = use(monkeypatch, StubContainer(
+        files={CONFIG_PATH: LIVE_CONFIG.encode()}, probe_status=probe_status
+    ))
 
     out = text_of(server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"}))
 
     assert out.startswith("Error"), out
+    assert expected_reason in out
     assert "Not writing without a backup" in out
     assert [c for c in stub.put_archive_calls if c["path"] == CONFIG_DIR] == []
     assert stub.files[CONFIG_PATH] == LIVE_CONFIG.encode()
+    assert _backups(stub) == []
+
+
+def test_probe_script_classifies_before_it_trusts_absence():
+    """The probe must ask -f, then -L, then -e — in that order — so only the
+    final branch means absence."""
+    script = server.config_probe_script()
+    assert f"[ -f " in script and "-L" in script and "-e" in script
+    assert script.index("-f") < script.index("-L") < script.index("-e")
+    assert f"exit {server.PROBE_ABSENT}; fi" in script
+    # Statuses must stay distinct or the classification collapses.
+    assert len({
+        server.PROBE_REGULAR_FILE, server.PROBE_ABSENT,
+        server.PROBE_NOT_REGULAR, server.PROBE_DANGLING_SYMLINK,
+    }) == 4
 
 
 def test_write_proceeds_without_a_backup_when_there_is_genuinely_no_config(monkeypatch):
@@ -552,6 +585,240 @@ def test_health_is_exempt_from_auth(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — the event loop must stay responsive, writes must stay serialised
+# ---------------------------------------------------------------------------
+
+async def wait_for(flag, timeout=2.0):
+    """Wait for a threading.Event without blocking the event loop.
+
+    If the tool dispatch were running inline on the loop, this coroutine would
+    not get a turn until the whole blocking call had finished — which is
+    exactly what the tests below detect.
+    """
+    deadline = time.monotonic() + timeout
+    while not flag.is_set():
+        if time.monotonic() > deadline:
+            return False
+        await asyncio.sleep(0.005)
+    return True
+
+
+def test_a_slow_write_does_not_stall_the_event_loop(monkeypatch):
+    """MAJOR 1: run_tool is fully blocking, so dispatching it inline would hold
+    the sole event-loop thread for the entire Docker round-trip."""
+    stub = use(monkeypatch, StubContainer(
+        files={CONFIG_PATH: LIVE_CONFIG.encode()},
+        block_on="cp",              # block during the backup step, mid-transaction
+    ))
+    finished = []
+
+    async def scenario():
+        write = asyncio.create_task(
+            server.call_tool("caddy_write_config", {"config": "a.example {\n}\n"})
+        )
+        write.add_done_callback(lambda _: finished.append(True))
+
+        assert await wait_for(stub.started), "the write never reached the backup step"
+
+        # The loop is alive while the write is parked inside Docker: another
+        # tool call runs to completion, and a plain coroutine gets its turns.
+        ticks = 0
+        for _ in range(5):
+            await asyncio.sleep(0)
+            ticks += 1
+        status = text_of(await server.call_tool("caddy_status", {}))
+
+        assert ticks == 5
+        assert '"status": "running"' in status
+        assert not finished, "the write completed before the concurrent call — it blocked the loop"
+
+        stub.release.set()
+        return text_of(await write)
+
+    result = asyncio.run(scenario())
+    assert result.startswith("✓"), result
+    assert stub.files[CONFIG_PATH] == b"a.example {\n}\n"
+
+
+async def call_health(app):
+    """Drive the /health route directly on the current event loop."""
+    route = [r for r in app.routes if getattr(r, "path", "") == "/health"][0]
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    await asyncio.wait_for(
+        route.handle(
+            {"type": "http", "method": "GET", "path": "/health", "headers": [],
+             "query_string": b"", "app": app, "root_path": ""},
+            receive, send,
+        ),
+        timeout=2.0,
+    )
+    return [m for m in sent if m["type"] == "http.response.start"][0]["status"]
+
+
+def test_health_stays_answerable_while_a_write_is_in_flight(monkeypatch, container):
+    """The endpoint that decides whether this container is healthy must not be
+    parked behind a slow write."""
+    container.block_on = "cp"
+    monkeypatch.setattr(server, "MCP_API_KEY", "")
+    monkeypatch.setattr(server, "get_docker_client", lambda: StubDockerClient(container))
+    app = server.create_app()
+
+    async def scenario():
+        write = asyncio.create_task(
+            server.call_tool("caddy_write_config", {"config": "a.example {\n}\n"})
+        )
+        assert await wait_for(container.started), "the write never reached the backup step"
+        assert not write.done(), "the write finished before health ran — it blocked the loop"
+
+        status = await call_health(app)
+
+        assert not write.done(), "health only answered once the write had finished"
+        container.release.set()
+        await write
+        return status
+
+    assert asyncio.run(scenario()) == 200
+
+
+def test_a_slow_health_probe_does_not_stall_the_event_loop(monkeypatch, container):
+    """/health makes blocking Docker calls of its own; those must be offloaded
+    too, or a hung daemon takes the whole loop down with it."""
+    monkeypatch.setattr(server, "MCP_API_KEY", "")
+    started, release = threading.Event(), threading.Event()
+    stub_client = StubDockerClient(container)
+
+    def slow_ping():
+        started.set()
+        release.wait(timeout=2.0)
+        return True
+
+    stub_client.ping = slow_ping
+    monkeypatch.setattr(server, "get_docker_client", lambda: stub_client)
+    app = server.create_app()
+
+    async def scenario():
+        probe = asyncio.create_task(call_health(app))
+        assert await wait_for(started), "health never reached the docker ping"
+
+        ticks = 0
+        for _ in range(5):
+            await asyncio.sleep(0)
+            ticks += 1
+
+        assert ticks == 5
+        assert not probe.done(), "health completed inline — it held the event loop"
+        release.set()
+        return await probe
+
+    assert asyncio.run(scenario()) == 200
+
+
+def test_two_concurrent_writes_do_not_interleave(monkeypatch):
+    """The transactions must be serialised, not merely both eventually done:
+    an interleaved backup/stage/rename can restore the wrong content."""
+    stub = use(monkeypatch, StubContainer(files={CONFIG_PATH: LIVE_CONFIG.encode()}))
+    original_run = stub._run
+
+    def slow_run(cmd):
+        if cmd[0] == "cp":          # widen the window the lock has to cover
+            time.sleep(0.02)
+        return original_run(cmd)
+
+    monkeypatch.setattr(stub, "_run", slow_run)
+
+    async def scenario():
+        return await asyncio.gather(
+            server.call_tool("caddy_write_config", {"config": "first {\n}\n"}),
+            server.call_tool("caddy_write_config", {"config": "second {\n}\n"}),
+        )
+
+    results = asyncio.run(scenario())
+    assert all(text_of(r).startswith("✓") for r in results)
+
+    # Both writes really did run on different threads...
+    threads = {thread for thread, _ in stub.call_log}
+    assert len(threads) == 2, f"expected two worker threads, saw {len(threads)}"
+
+    # ...and their call spans in the ordered log do not overlap.
+    spans = {}
+    for index, (thread, _) in enumerate(stub.call_log):
+        first, last = spans.get(thread, (index, index))
+        spans[thread] = (min(first, index), max(last, index))
+    (a_first, a_last), (b_first, b_last) = sorted(spans.values())
+    assert a_last < b_first, (
+        f"transactions interleaved: {a_first}-{a_last} overlaps {b_first}-{b_last}"
+    )
+
+    # One backup per write, and the survivor is one of the two configs.
+    assert len(_backups(stub)) == 2
+    assert stub.files[CONFIG_PATH] in (b"first {\n}\n", b"second {\n}\n")
+
+
+def test_write_lock_is_held_across_the_whole_transaction(monkeypatch):
+    """A second writer cannot start while the first holds the lock."""
+    stub = use(monkeypatch, StubContainer(
+        files={CONFIG_PATH: LIVE_CONFIG.encode()},
+        block_on="cp",
+    ))
+
+    async def scenario():
+        first = asyncio.create_task(
+            server.call_tool("caddy_write_config", {"config": "first {\n}\n"})
+        )
+        assert await wait_for(stub.started)
+        calls_before = len(stub.call_log)
+
+        second = asyncio.create_task(
+            server.call_tool("caddy_write_config", {"config": "second {\n}\n"})
+        )
+        for _ in range(20):                 # give it every chance to barge in
+            await asyncio.sleep(0.005)
+        assert len(stub.call_log) == calls_before, (
+            "a second write started while the first held the lock"
+        )
+
+        stub.release.set()
+        return text_of(await first), text_of(await second)
+
+    first_result, second_result = asyncio.run(scenario())
+    assert first_result.startswith("✓")
+    assert second_result.startswith("✓")
+
+
+def test_docker_timeout_is_explicit_and_configurable(monkeypatch):
+    """The write transaction's maximum duration must not rest on an SDK
+    default, since the lock is held across the whole sequence."""
+    assert server.DOCKER_TIMEOUT == 30            # documented default
+
+    captured = {}
+
+    class FakeDocker:
+        @staticmethod
+        def DockerClient(**kwargs):
+            captured.update(kwargs)
+            return "client"
+
+    monkeypatch.setattr(server, "_docker_client", None)
+    monkeypatch.setattr(server, "docker", FakeDocker)
+    monkeypatch.setattr(server, "DOCKER_TIMEOUT", 7)
+
+    assert server.get_docker_client() == "client"
+    assert captured["timeout"] == 7
+    assert captured["base_url"] == server.DOCKER_SOCKET
+    # Cached, not rebuilt per call.
+    assert server.get_docker_client() == "client"
+
+    monkeypatch.setattr(server, "_docker_client", None)
 
 
 # ---------------------------------------------------------------------------

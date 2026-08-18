@@ -6,7 +6,10 @@ rename, roll back) can be exercised with no Docker daemon anywhere in sight.
 """
 
 import io
+import re
+import shlex
 import tarfile
+import threading
 
 
 class StubExecResult:
@@ -25,6 +28,10 @@ class StubContainer:
     put_archive_fail_paths : destination directories put_archive rejects
     fail           : {command_name: (exit_code, output)} to force a failure,
                      e.g. {"mv": (1, "mv: cross-device link")}
+    probe_status   : force the config-type probe's exit status (see PROBE_* in
+                     server.py); by default it is derived from `files`
+    block_on       : command name whose first call blocks until `release` is
+                     set, for exercising concurrency
     """
 
     name = "caddy"
@@ -41,6 +48,8 @@ class StubContainer:
         fail=None,
         logs_data=b"log line\n",
         attrs=None,
+        probe_status=None,
+        block_on=None,
     ):
         self.files = dict(files or {})
         self.validate_ok = validate_ok
@@ -54,6 +63,14 @@ class StubContainer:
             "Config": {"Image": "caddy:2-alpine"},
             "RestartCount": 0,
         }
+        self.probe_status = probe_status
+        self.block_on = block_on
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.block_timeout = 2.0
+        # Ordered log of every container interaction, with the calling thread,
+        # so tests can prove two transactions did not interleave.
+        self.call_log = []
         self.exec_calls = []
         self.put_archive_calls = []
         self.logs_calls = []
@@ -76,6 +93,7 @@ class StubContainer:
 
     def put_archive(self, path, data):
         raw = data.read() if hasattr(data, "read") else data
+        self.call_log.append((threading.get_ident(), f"put_archive {path}"))
         self.put_archive_calls.append({"path": path, "data": raw})
         if not self.put_archive_ok or path.rstrip("/") in self.put_archive_fail_paths:
             return False
@@ -87,7 +105,11 @@ class StubContainer:
         return self.put_archive_ok
 
     def exec_run(self, cmd, demux=False):
+        self.call_log.append((threading.get_ident(), " ".join(cmd)))
         self.exec_calls.append(list(cmd))
+        if self.block_on and cmd[0] == self.block_on:
+            self.started.set()
+            self.release.wait(timeout=self.block_timeout)
         exit_code, output = self._run(list(cmd))
         return StubExecResult(exit_code, output.encode("utf-8") if isinstance(output, str) else output)
 
@@ -103,9 +125,6 @@ class StubContainer:
             if path not in self.files:
                 return 1, f"cat: {path}: No such file or directory"
             return 0, self.files[path].decode("utf-8")
-
-        if program == "test":
-            return (0, "") if cmd[-1] in self.files else (1, "")
 
         if program in ("cp", "mv"):
             src, dst = [a for a in cmd[1:] if not a.startswith("-")]
@@ -125,9 +144,19 @@ class StubContainer:
             return (0 if self.validate_ok else 1), self.validate_output
 
         if program == "sh":
-            return 0, ""
+            script = cmd[-1]
+            if "[ -f " in script:              # the config-type probe
+                return self._probe(script), ""
+            return 0, ""                       # the prune script
 
         return 127, f"{program}: not found"
+
+    def _probe(self, script):
+        """Mimic the server's -f / -L / -e classification of the config path."""
+        if self.probe_status is not None:
+            return self.probe_status
+        path = shlex.split(re.search(r"\[ -f (.+?) \]", script).group(1))[0]
+        return 0 if path in self.files else 1
 
 
 class StubDockerClient:
