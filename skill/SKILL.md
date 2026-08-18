@@ -19,12 +19,12 @@ You have direct MCP access to the Caddy reverse proxy on docker-proxy1 via the
 
 | Tool | What it does |
 |------|-------------|
-| `caddy_read_config` | Read the full current Caddyfile from disk |
-| `caddy_write_config` | Write a new Caddyfile (validate first, reload after) |
+| `caddy_read_config` | Read the full current Caddyfile from inside the Caddy container |
+| `caddy_write_config` | **Replaces the entire Caddyfile.** Validate first, reload after |
 | `caddy_validate` | Validate a config without applying it |
 | `caddy_reload` | Reload Caddy with the config currently on disk |
 | `caddy_get_logs` | Fetch recent container logs (pass `lines` to control count) |
-| `caddy_status` | Check container status, uptime, restart count |
+| `caddy_status` | Check container status, start time, restart count |
 
 ## Standard Workflow for Any Config Change
 
@@ -39,10 +39,17 @@ Always follow this order — skipping steps risks downtime:
 
 Never skip validation. Never overwrite the full config without reading it first.
 
+`caddy_write_config` is a whole-file replacement, not an append. Anything you leave out of the
+string you pass is deleted from the live config. That is why step 1 is non-negotiable.
+
+If Caddy is running with `--watch`, it picks up the file as soon as it changes, so a bad write
+can take effect before you reach step 5. Validation is the only thing standing between a typo
+and downtime.
+
 ## Server Details
 
 - Host: docker-proxy1 (192.168.10.41)
-- Caddyfile on host: `/docker/caddy/caddyfile`
+- Caddyfile on host: `/docker/caddy/Caddyfile` (capital C)
 - Caddy container name: `caddy`
 - Caddy config path inside container: `/etc/caddy/Caddyfile`
 
@@ -86,7 +93,7 @@ service.domain.com {
 ### Basic auth
 ```
 service.domain.com {
-    basicauth {
+    basic_auth {
         # Generate hash: caddy hash-password --plaintext yourpassword
         username HASHED_PASSWORD_HERE
     }
