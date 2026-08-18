@@ -79,7 +79,7 @@ BACKUP_SUFFIX_GLOB = (
 PROBE_REGULAR_FILE = 0
 PROBE_ABSENT = 1
 PROBE_NOT_REGULAR = 3
-PROBE_DANGLING_SYMLINK = 4
+PROBE_SYMLINK_TO_NON_REGULAR = 4
 
 LOG_LINES_DEFAULT = 100
 LOG_LINES_MIN = 1
@@ -87,7 +87,8 @@ LOG_LINES_MAX = 2000
 
 server = Server("caddy-mcp")
 
-_docker_client = None
+# Docker clients are per-thread; see get_docker_client().
+_thread_local = threading.local()
 # Serialises the write transaction so two callers cannot interleave
 # backup/stage/rename against the same file.
 #
@@ -110,17 +111,33 @@ class ToolError(Exception):
 # ---------------------------------------------------------------------------
 
 def get_docker_client():
-    """Return the (lazily created) Docker client.
+    """Return this thread's Docker client, created on first use.
 
-    Created on first use rather than at import time so the module can be
-    imported — and unit-tested — on a machine with no Docker daemon.
+    Per-thread, not shared. docker-py's APIClient subclasses requests.Session,
+    and Requests gives no thread-safety guarantee for concurrent use of one
+    Session — its connection pool and cookie jar are the usual hazards. Since
+    tool dispatch and /health moved onto worker threads, a single shared client
+    would be used concurrently by reads, validation, logs, status, reload and
+    the healthcheck (_write_lock serialises writes against writes, nothing
+    more). A client per thread sidesteps that without a global Docker lock,
+    which would undo the offload and could park /health behind a long write.
+
+    Thread-local storage also settles the initialisation race: each thread
+    fills only its own slot, so concurrent first use cannot build several
+    clients and throw all but one away.
+
+    The count stays bounded — asyncio.to_thread uses the default executor,
+    capped around min(32, cpu + 4) threads.
+
+    Still lazy, and it must stay that way: constructing a client at import time
+    turns an unreachable or unauthorised daemon into a crash loop (this one
+    reached RestartCount 6609) instead of a tool call that returns an error.
     """
-    global _docker_client
-    if _docker_client is None:
-        _docker_client = docker.DockerClient(
-            base_url=DOCKER_SOCKET, timeout=DOCKER_TIMEOUT
-        )
-    return _docker_client
+    client = getattr(_thread_local, "client", None)
+    if client is None:
+        client = docker.DockerClient(base_url=DOCKER_SOCKET, timeout=DOCKER_TIMEOUT)
+        _thread_local.client = client
+    return client
 
 
 def get_container():
@@ -235,13 +252,14 @@ def config_probe_script() -> str:
     """Shell that classifies the config path into one PROBE_* status.
 
     -f is checked first (it follows symlinks, so a symlink to a regular file is
-    a regular file), then -L to catch a dangling symlink, then -e for anything
-    else that exists. Only the final branch is genuine absence.
+    a regular file), then -L for a symlink whose target is missing or is not a
+    regular file, then -e for anything else that exists. Only the final branch
+    is genuine absence.
     """
     path = shlex.quote(CADDY_CONTAINER_CONFIG)
     return (
         f"if [ -f {path} ]; then exit {PROBE_REGULAR_FILE}; "
-        f"elif [ -L {path} ]; then exit {PROBE_DANGLING_SYMLINK}; "
+        f"elif [ -L {path} ]; then exit {PROBE_SYMLINK_TO_NON_REGULAR}; "
         f"elif [ -e {path} ]; then exit {PROBE_NOT_REGULAR}; "
         f"else exit {PROBE_ABSENT}; fi"
     )
@@ -269,7 +287,13 @@ def backup_config(container) -> str:
                 "something exists at that path but it is not a regular file "
                 "(a directory, socket or device)"
             ),
-            PROBE_DANGLING_SYMLINK: "that path is a symlink to a missing target",
+            # -f already failed, so the target is missing, or it exists and
+            # is not a regular file. The check cannot tell those apart, so the
+            # message does not pretend to.
+            PROBE_SYMLINK_TO_NON_REGULAR: (
+                "that path is a symlink whose target is missing or is not a "
+                "regular file"
+            ),
         }
         reason = reasons.get(
             probe_code,

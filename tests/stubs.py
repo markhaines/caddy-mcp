@@ -172,3 +172,17 @@ class StubDockerClient:
         if not self.ping_ok:
             raise RuntimeError("docker daemon unreachable")
         return True
+
+
+class FakeDockerModule:
+    """Stands in for the `docker` module so client construction can be observed
+    without a daemon. `errors` is the real thing, so exception handling in
+    server.py keeps working."""
+
+    def __init__(self, factory):
+        self._factory = factory
+        import docker as real_docker
+        self.errors = real_docker.errors
+
+    def DockerClient(self, **kwargs):
+        return self._factory(**kwargs)

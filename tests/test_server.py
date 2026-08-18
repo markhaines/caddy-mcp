@@ -2,6 +2,11 @@
 
 import asyncio
 import datetime
+import os
+import pathlib
+import subprocess
+import sys
+import textwrap
 import fnmatch
 import io
 import time
@@ -13,7 +18,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import server
-from stubs import StubContainer, StubDockerClient
+from stubs import FakeDockerModule, StubContainer, StubDockerClient
 
 CONFIG_PATH = server.CADDY_CONTAINER_CONFIG          # /etc/caddy/Caddyfile
 CONFIG_DIR = "/etc/caddy"
@@ -482,7 +487,8 @@ def test_backup_names_do_not_collide_within_one_second(container, monkeypatch):
     "probe_status,expected_reason",
     [
         (server.PROBE_NOT_REGULAR, "not a regular file"),
-        (server.PROBE_DANGLING_SYMLINK, "symlink to a missing target"),
+        (server.PROBE_SYMLINK_TO_NON_REGULAR,
+         "symlink whose target is missing or is not a regular file"),
         (127, "the check itself failed"),
         (2, "the check itself failed"),
     ],
@@ -516,7 +522,7 @@ def test_probe_script_classifies_before_it_trusts_absence():
     # Statuses must stay distinct or the classification collapses.
     assert len({
         server.PROBE_REGULAR_FILE, server.PROBE_ABSENT,
-        server.PROBE_NOT_REGULAR, server.PROBE_DANGLING_SYMLINK,
+        server.PROBE_NOT_REGULAR, server.PROBE_SYMLINK_TO_NON_REGULAR,
     }) == 4
 
 
@@ -800,25 +806,179 @@ def test_docker_timeout_is_explicit_and_configurable(monkeypatch):
     default, since the lock is held across the whole sequence."""
     assert server.DOCKER_TIMEOUT == 30            # documented default
 
-    captured = {}
-
-    class FakeDocker:
-        @staticmethod
-        def DockerClient(**kwargs):
-            captured.update(kwargs)
-            return "client"
-
-    monkeypatch.setattr(server, "_docker_client", None)
-    monkeypatch.setattr(server, "docker", FakeDocker)
+    captured = []
+    monkeypatch.setattr(server, "_thread_local", threading.local())
     monkeypatch.setattr(server, "DOCKER_TIMEOUT", 7)
+    monkeypatch.setattr(
+        server, "docker",
+        FakeDockerModule(lambda **kwargs: captured.append(kwargs) or "client"),
+    )
 
     assert server.get_docker_client() == "client"
-    assert captured["timeout"] == 7
-    assert captured["base_url"] == server.DOCKER_SOCKET
-    # Cached, not rebuilt per call.
+    assert captured[0]["timeout"] == 7
+    assert captured[0]["base_url"] == server.DOCKER_SOCKET
+    # Cached per thread, not rebuilt on every call.
     assert server.get_docker_client() == "client"
+    assert len(captured) == 1
 
-    monkeypatch.setattr(server, "_docker_client", None)
+
+# ---------------------------------------------------------------------------
+# Round 4 — one Docker client per thread, and it stays lazy
+# ---------------------------------------------------------------------------
+
+class RecordingClient:
+    """A DockerClient stand-in that knows which container stub to hand back."""
+
+    stub = None
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.containers = _Containers(self)
+
+
+class _Containers:
+    def __init__(self, client):
+        self.client = client
+
+    def get(self, name):
+        RecordingClient.stub.clients_used.append(id(self.client))
+        return RecordingClient.stub
+
+
+def test_each_thread_gets_its_own_docker_client(monkeypatch):
+    """docker-py's APIClient is a requests.Session, and Requests makes no
+    thread-safety promise for concurrent use of one Session — so two offloaded
+    calls must never be holding the same client."""
+    created = []
+    monkeypatch.setattr(server, "_thread_local", threading.local())
+    monkeypatch.setattr(
+        server, "docker",
+        FakeDockerModule(lambda **kwargs: created.append(kwargs) or object()),
+    )
+
+    thread_count = 4
+    barrier = threading.Barrier(thread_count)
+    results = {}
+
+    def worker(index):
+        barrier.wait(timeout=5)          # force genuinely concurrent first use
+        first = server.get_docker_client()
+        second = server.get_docker_client()
+        results[index] = (first, second)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert len(results) == thread_count
+    # Every thread reuses its own client...
+    for index, (first, second) in results.items():
+        assert first is second, f"thread {index} rebuilt its client"
+    # ...and no two threads were ever handed the same one.
+    identities = {id(first) for first, _ in results.values()}
+    assert len(identities) == thread_count, "a DockerClient was shared between threads"
+
+
+def test_concurrent_first_use_builds_exactly_one_client_per_thread(monkeypatch):
+    """The old `global` lazy init was unsynchronised: concurrent first use
+    could construct several clients and discard all but one."""
+    created = []
+    monkeypatch.setattr(server, "_thread_local", threading.local())
+    monkeypatch.setattr(
+        server, "docker",
+        FakeDockerModule(lambda **kwargs: created.append(kwargs) or object()),
+    )
+
+    thread_count = 4
+    barrier = threading.Barrier(thread_count)
+
+    def worker():
+        barrier.wait(timeout=5)
+        for _ in range(3):
+            server.get_docker_client()
+
+    threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(created) == thread_count, (
+        f"expected one client per thread, {len(created)} were constructed"
+    )
+
+
+def test_concurrent_tool_calls_do_not_share_a_docker_client(monkeypatch):
+    """End to end through the real get_container() path, with both threads
+    provably inside the tool at the same time."""
+    stub = StubContainer(files={CONFIG_PATH: LIVE_CONFIG.encode()})
+    stub.clients_used = []
+    RecordingClient.stub = stub
+
+    barrier = threading.Barrier(2)
+    real_exec_run = stub.exec_run
+
+    def exec_run(cmd, demux=False):
+        if cmd[0] == "cat":
+            barrier.wait(timeout=5)      # neither call can finish alone
+        return real_exec_run(cmd, demux=demux)
+
+    monkeypatch.setattr(stub, "exec_run", exec_run)
+    monkeypatch.setattr(server, "_thread_local", threading.local())
+    monkeypatch.setattr(server, "docker", FakeDockerModule(RecordingClient))
+    # get_container() is deliberately NOT patched here.
+
+    async def scenario():
+        return await asyncio.gather(
+            server.call_tool("caddy_read_config", {}),
+            server.call_tool("caddy_read_config", {}),
+        )
+
+    results = asyncio.run(scenario())
+
+    assert [text_of(r) for r in results] == [LIVE_CONFIG, LIVE_CONFIG]
+    assert len(stub.clients_used) == 2
+    assert len(set(stub.clients_used)) == 2, "both threads used the same DockerClient"
+
+
+def test_module_imports_with_no_daemon_and_builds_no_client():
+    """The lazy behaviour is load-bearing: building a client at import turned an
+    unreachable daemon into a crash loop (RestartCount reached 6609)."""
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    socket = "unix:///nonexistent/caddy-mcp-test.sock"
+    script = textwrap.dedent(
+        """
+        import os, sys
+        import docker
+
+        # First prove the socket really is unreachable, so a clean import below
+        # means nothing was constructed rather than that a daemon answered.
+        try:
+            docker.DockerClient(base_url=os.environ["DOCKER_SOCKET"])
+        except docker.errors.DockerException:
+            pass
+        else:
+            sys.exit("socket was reachable - this test would prove nothing")
+
+        import server
+        assert getattr(server._thread_local, "client", None) is None
+        print("IMPORTED-CLEAN")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env={**os.environ, "DOCKER_SOCKET": socket},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "IMPORTED-CLEAN" in result.stdout
 
 
 # ---------------------------------------------------------------------------
