@@ -1,0 +1,53 @@
+services:
+  # Dedicated, internal-only Docker socket-proxy for the Caddy MCP.
+  # NOT published to the LAN — reachable only by caddy-mcp on the internal
+  # network. Grants just what the MCP needs: read containers + exec + post
+  # (put_archive/exec_start) against the local docker.sock.
+  socket-proxy-cm:
+    image: ghcr.io/tecnativa/docker-socket-proxy:latest
+    container_name: caddy-mcp-socket-proxy
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+      - EXEC=1
+      - POST=1
+      - INFO=1
+      # Required by caddy_status: container.image.tags reads /images/{id}/json.
+      - IMAGES=1
+      - VERSION=1
+      - ALLOW_RESTARTS=0
+      - ALLOW_START=0
+      - ALLOW_STOP=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - internal
+    # no ports: internal-only
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null --timeout=5 http://127.0.0.1:2375/_ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  caddy-mcp:
+    image: caddy-mcp:latest
+    container_name: caddy-mcp
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy-cm
+    ports:
+      - "8811:8000"
+    environment:
+      - CADDY_CONTAINER=caddy
+      - DOCKER_SOCKET=tcp://caddy-mcp-socket-proxy:2375
+      - CADDY_CONTAINER_CONFIG=/etc/caddy/Caddyfile
+      - MCP_API_KEY=${MCP_API_KEY}
+      - PORT=8000
+      - ROOT_PATH=/caddy
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
