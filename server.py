@@ -5,11 +5,14 @@ Provides Claude with tools to manage a Caddy reverse proxy via the Docker API.
 Runs as a container on the same host as Caddy, using the local Docker socket.
 """
 
+import hmac
 import io
 import json
 import logging
 import os
 import tarfile
+import uuid
+from datetime import datetime, timezone
 
 import docker
 import uvicorn
@@ -39,17 +42,45 @@ PORT = int(os.environ.get("PORT", "8000"))
 # which the client then POSTs back to via the same reverse proxy.
 ROOT_PATH = os.environ.get("ROOT_PATH", "").rstrip("/")
 
-docker_client = docker.DockerClient(base_url=DOCKER_SOCKET)
+# How many of our own timestamped backups to keep beside the live Caddyfile.
+BACKUP_KEEP = int(os.environ.get("CADDY_BACKUP_KEEP", "10"))
+# Backups this server writes are named <config>.bak-YYYYmmddTHHMMSSZ. Pruning
+# only ever matches that exact shape, so hand-made backups sitting in the same
+# directory under other naming schemes are never touched.
+BACKUP_SUFFIX_GLOB = ".bak-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z"
+
+LOG_LINES_DEFAULT = 100
+LOG_LINES_MIN = 1
+LOG_LINES_MAX = 2000
+
 server = Server("caddy-mcp")
+
+_docker_client = None
+
+
+class ToolError(Exception):
+    """A failure that should be reported back to the caller as an MCP error."""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def get_docker_client():
+    """Return the (lazily created) Docker client.
+
+    Created on first use rather than at import time so the module can be
+    imported — and unit-tested — on a machine with no Docker daemon.
+    """
+    global _docker_client
+    if _docker_client is None:
+        _docker_client = docker.DockerClient(base_url=DOCKER_SOCKET)
+    return _docker_client
+
+
 def get_container():
     """Get the Caddy container, raising a clear error if not found."""
-    return docker_client.containers.get(CADDY_CONTAINER)
+    return get_docker_client().containers.get(CADDY_CONTAINER)
 
 
 def pack_tar(filename: str, content: bytes) -> io.BytesIO:
@@ -63,6 +94,225 @@ def pack_tar(filename: str, content: bytes) -> io.BytesIO:
     return buf
 
 
+def exec_in_container(container, cmd: list) -> tuple:
+    """Run a command in the Caddy container.
+
+    Returns (exit_code, output). The caller MUST look at the exit code before
+    using the output: with demux=False docker merges stderr into stdout, so a
+    failed command's output is an error message, never file content.
+    A missing exit code is normalised to -1 (i.e. "not success").
+    """
+    result = container.exec_run(cmd, demux=False)
+    output = (result.output or b"").decode("utf-8", errors="replace")
+    exit_code = -1 if result.exit_code is None else int(result.exit_code)
+    return exit_code, output
+
+
+def put_archive_checked(container, path: str, tar, what: str) -> None:
+    """put_archive, checking the return value. Raises ToolError on failure."""
+    ok = container.put_archive(path, tar)
+    if not ok:
+        raise ToolError(
+            f"Docker rejected the upload while {what}: put_archive({path!r}) "
+            f"returned {ok!r} for container '{CADDY_CONTAINER}'."
+        )
+
+
+def require_str_arg(arguments: dict, key: str) -> str:
+    """Fetch a required string argument with a message that names it."""
+    if not isinstance(arguments, dict) or key not in arguments:
+        raise ToolError(
+            f"Missing required argument '{key}'. Pass it as a string in the "
+            f"tool's arguments object."
+        )
+    value = arguments[key]
+    if not isinstance(value, str):
+        raise ToolError(
+            f"Argument '{key}' must be a string, got {type(value).__name__}."
+        )
+    return value
+
+
+def read_config(container) -> str:
+    """Read the live Caddyfile out of the container.
+
+    Raises ToolError on a non-zero exit so a `cat: ... No such file` message can
+    never be handed back to the caller as if it were the config — a caller that
+    then edited and wrote it back would replace the whole live config.
+    """
+    exit_code, output = exec_in_container(container, ["cat", CADDY_CONTAINER_CONFIG])
+    if exit_code != 0:
+        raise ToolError(
+            f"Could not read the Caddyfile at {CADDY_CONTAINER_CONFIG} in "
+            f"container '{CADDY_CONTAINER}' (cat exited {exit_code}): "
+            f"{output.strip() or '(no output)'}. "
+            f"No config content was returned — do NOT write a config based on "
+            f"this response. Check CADDY_CONTAINER_CONFIG and that the "
+            f"container has the config bind-mounted."
+        )
+    return output
+
+
+def validate_config(container, config: str) -> tuple:
+    """Validate a config's exact bytes inside the container.
+
+    Returns (is_valid, validator_output). Staged under a unique name so
+    concurrent calls cannot clobber each other, and cleaned up in a finally.
+    """
+    staged = f"/tmp/Caddyfile.validate-{uuid.uuid4().hex}"
+    put_archive_checked(
+        container,
+        "/tmp",
+        pack_tar(os.path.basename(staged), config.encode("utf-8")),
+        f"staging a config for validation at {staged}",
+    )
+    try:
+        exit_code, output = exec_in_container(
+            container,
+            ["caddy", "validate", "--config", staged, "--adapter", "caddyfile"],
+        )
+        return exit_code == 0, output.strip()
+    finally:
+        cleanup_code, cleanup_output = exec_in_container(container, ["rm", "-f", staged])
+        if cleanup_code != 0:
+            log.warning(
+                "Failed to remove validation temp file %s (exit %d): %s",
+                staged, cleanup_code, cleanup_output.strip(),
+            )
+
+
+def backup_config(container) -> str:
+    """Copy the live Caddyfile aside. Returns the backup path, or "" if there
+    was no existing file to back up."""
+    exists_code, _ = exec_in_container(container, ["test", "-f", CADDY_CONTAINER_CONFIG])
+    if exists_code != 0:
+        log.warning(
+            "No existing file at %s to back up before writing", CADDY_CONTAINER_CONFIG
+        )
+        return ""
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = f"{CADDY_CONTAINER_CONFIG}.bak-{stamp}"
+    exit_code, output = exec_in_container(
+        container, ["cp", "-p", CADDY_CONTAINER_CONFIG, backup]
+    )
+    if exit_code != 0:
+        raise ToolError(
+            f"Refusing to write: could not back up {CADDY_CONTAINER_CONFIG} to "
+            f"{backup} (cp exited {exit_code}): {output.strip() or '(no output)'}. "
+            f"The live config is unchanged."
+        )
+    log.info("Backed up %s to %s", CADDY_CONTAINER_CONFIG, backup)
+    return backup
+
+
+def prune_backups(container) -> None:
+    """Keep only the newest BACKUP_KEEP backups written by this server.
+
+    Best-effort: a failure here is logged, never surfaced as a write failure.
+    The names sort lexicographically by timestamp, so `sort -r` is newest-first.
+    """
+    pattern = f"{CADDY_CONTAINER_CONFIG}{BACKUP_SUFFIX_GLOB}"
+    script = (
+        f"ls -1d {pattern} 2>/dev/null | sort -r | tail -n +{BACKUP_KEEP + 1} "
+        f'| while read -r f; do rm -f "$f"; done'
+    )
+    exit_code, output = exec_in_container(container, ["sh", "-c", script])
+    if exit_code != 0:
+        log.warning("Backup pruning failed (exit %d): %s", exit_code, output.strip())
+
+
+def restore_backup(container, backup: str) -> str:
+    """Put a backup back over the live config. Returns a human-readable outcome."""
+    if not backup:
+        return (
+            "Rollback: no backup existed (there was no file at "
+            f"{CADDY_CONTAINER_CONFIG} beforehand), so nothing was restored."
+        )
+    exit_code, output = exec_in_container(
+        container, ["cp", "-p", backup, CADDY_CONTAINER_CONFIG]
+    )
+    if exit_code != 0:
+        log.error("Rollback failed from %s (exit %d)", backup, exit_code)
+        return (
+            f"Rollback FAILED: could not restore {backup} over "
+            f"{CADDY_CONTAINER_CONFIG} (cp exited {exit_code}): "
+            f"{output.strip() or '(no output)'}. MANUAL ACTION REQUIRED — the "
+            f"live config may be in an unknown state."
+        )
+    log.info("Rolled %s back from %s", CADDY_CONTAINER_CONFIG, backup)
+    return f"Rollback: restored {CADDY_CONTAINER_CONFIG} from {backup}."
+
+
+def write_config(container, config: str) -> str:
+    """Validate, back up, then atomically replace the live Caddyfile.
+
+    Order matters: the exact bytes that will be committed are validated first,
+    so validation cannot be bypassed by validating one value and writing
+    another. The new file is staged under a unique temp name in the same
+    directory and renamed over the target, so `--watch` can never observe a
+    truncated config. Any failure after the backup exists triggers a restore.
+    """
+    directory = os.path.dirname(CADDY_CONTAINER_CONFIG) or "/"
+    filename = os.path.basename(CADDY_CONTAINER_CONFIG)
+
+    is_valid, validator_output = validate_config(container, config)
+    if not is_valid:
+        raise ToolError(
+            "Refusing to write: the supplied config failed `caddy validate`. "
+            "Nothing was changed and the live config is untouched.\n"
+            f"{validator_output or '(no validator output)'}"
+        )
+
+    backup = backup_config(container)
+    staged_name = f".{filename}.tmp-{uuid.uuid4().hex}"
+    staged_path = f"{directory.rstrip('/')}/{staged_name}"
+
+    try:
+        put_archive_checked(
+            container,
+            directory,
+            pack_tar(staged_name, config.encode("utf-8")),
+            f"staging the new config at {staged_path}",
+        )
+        exit_code, output = exec_in_container(
+            container, ["mv", "-f", staged_path, CADDY_CONTAINER_CONFIG]
+        )
+        if exit_code != 0:
+            raise ToolError(
+                f"Could not move the staged config {staged_path} over "
+                f"{CADDY_CONTAINER_CONFIG} (mv exited {exit_code}): "
+                f"{output.strip() or '(no output)'}."
+            )
+    except Exception as exc:
+        # Never let a cleanup failure hide the failure that caused it.
+        try:
+            exec_in_container(container, ["rm", "-f", staged_path])
+            rollback = restore_backup(container, backup)
+        except Exception as rollback_exc:
+            rollback = (
+                f"Rollback FAILED: {rollback_exc}. MANUAL ACTION REQUIRED — "
+                f"the live config may be in an unknown state"
+                + (f"; a backup is at {backup}." if backup else ".")
+            )
+        raise ToolError(f"Write failed: {exc}\n{rollback}") from exc
+
+    log.info(
+        "Caddyfile written to %s in container (%d bytes, backup %s)",
+        CADDY_CONTAINER_CONFIG, len(config.encode("utf-8")), backup or "none",
+    )
+    prune_backups(container)
+
+    lines = [
+        f"✓ Caddyfile written to {CADDY_CONTAINER_CONFIG} "
+        f"({len(config.encode('utf-8'))} bytes). Validated before writing.",
+        f"Backup: {backup}" if backup else "Backup: none (no previous file existed).",
+        "If Caddy runs with --watch the new config is already being picked up; "
+        "otherwise call caddy_reload to apply it.",
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # MCP tool definitions
 # ---------------------------------------------------------------------------
@@ -72,21 +322,35 @@ async def list_tools():
     return [
         Tool(
             name="caddy_read_config",
-            description="Read the current Caddyfile from disk.",
+            description=(
+                "Read the complete current Caddyfile from disk. This is the "
+                "required first step before any caddy_write_config call."
+            ),
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="caddy_write_config",
             description=(
-                "Write a new Caddyfile to disk. "
-                "Always call caddy_validate first, then caddy_reload after writing."
+                "DESTRUCTIVE — REPLACES THE ENTIRE CADDYFILE with the content you "
+                "supply. This is a whole-file overwrite, not an append or a merge: "
+                "every site block you leave out is deleted and those sites go "
+                "offline. You MUST call caddy_read_config first and send back the "
+                "complete file with your change applied. The exact bytes you send "
+                "are validated before anything is committed and the write is "
+                "refused if validation fails; the previous file is backed up first "
+                "and restored automatically if the write fails partway. If Caddy "
+                "runs with --watch the write applies itself, otherwise call "
+                "caddy_reload afterwards."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "config": {
                         "type": "string",
-                        "description": "The complete Caddyfile content to write.",
+                        "description": (
+                            "The COMPLETE Caddyfile content. Whatever you pass "
+                            "becomes the entire file; anything omitted is lost."
+                        ),
                     }
                 },
                 "required": ["config"],
@@ -96,7 +360,10 @@ async def list_tools():
             name="caddy_validate",
             description=(
                 "Validate a Caddyfile without applying it. "
-                "Returns any syntax or configuration errors."
+                "Returns any syntax or configuration errors. "
+                "caddy_write_config validates its own input as well, so this is "
+                "for checking a draft, not a prerequisite you can satisfy on its "
+                "behalf."
             ),
             inputSchema={
                 "type": "object",
@@ -125,7 +392,10 @@ async def list_tools():
                 "properties": {
                     "lines": {
                         "type": "integer",
-                        "description": "Number of log lines to return (default: 100).",
+                        "description": "Number of log lines to return.",
+                        "default": LOG_LINES_DEFAULT,
+                        "minimum": LOG_LINES_MIN,
+                        "maximum": LOG_LINES_MAX,
                     }
                 },
             },
@@ -142,95 +412,111 @@ async def list_tools():
 # MCP tool implementations
 # ---------------------------------------------------------------------------
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list:
+def tool_read_config(arguments: dict) -> str:
+    return read_config(get_container())
+
+
+def tool_write_config(arguments: dict) -> str:
+    config = require_str_arg(arguments, "config")
+    return write_config(get_container(), config)
+
+
+def tool_validate(arguments: dict) -> str:
+    config = require_str_arg(arguments, "config")
+    is_valid, output = validate_config(get_container(), config)
+    prefix = "✓ Valid" if is_valid else "✗ Invalid"
+    return f"{prefix}\n{output}" if output else prefix
+
+
+def tool_reload(arguments: dict) -> str:
+    exit_code, output = exec_in_container(
+        get_container(),
+        ["caddy", "reload", "--config", CADDY_CONTAINER_CONFIG, "--adapter", "caddyfile"],
+    )
+    output = output.strip()
+    prefix = "✓ Caddy reloaded successfully" if exit_code == 0 else "✗ Reload failed"
+    log.info("caddy reload: exit=%d", exit_code)
+    return f"{prefix}\n{output}" if output else prefix
+
+
+def tool_get_logs(arguments: dict) -> str:
+    raw = arguments.get("lines", LOG_LINES_DEFAULT)
     try:
-        # -- Read Caddyfile --------------------------------------------------
-        if name == "caddy_read_config":
-            container = get_container()
-            result = container.exec_run(["cat", CADDY_CONTAINER_CONFIG], demux=False)
-            content = result.output.decode("utf-8", errors="replace")
-            return [TextContent(type="text", text=content)]
+        lines = int(raw)
+    except (TypeError, ValueError):
+        raise ToolError(f"Argument 'lines' must be an integer, got {raw!r}.")
+    lines = max(LOG_LINES_MIN, min(lines, LOG_LINES_MAX))
+    logs = get_container().logs(tail=lines, timestamps=True).decode("utf-8", errors="replace")
+    return logs or "(no logs)"
 
-        # -- Write Caddyfile -------------------------------------------------
-        elif name == "caddy_write_config":
-            config = arguments["config"]
-            container = get_container()
-            filename = os.path.basename(CADDY_CONTAINER_CONFIG)
-            directory = os.path.dirname(CADDY_CONTAINER_CONFIG)
-            tar = pack_tar(filename, config.encode("utf-8"))
-            container.put_archive(directory, tar)
-            log.info("Caddyfile written to %s in container", CADDY_CONTAINER_CONFIG)
-            return [TextContent(type="text", text="✓ Caddyfile written. Call caddy_reload to apply.")]
 
-        # -- Validate --------------------------------------------------------
-        elif name == "caddy_validate":
-            config = arguments["config"]
-            container = get_container()
-            # Copy config into the container at a temp path, validate, then clean up.
-            tar = pack_tar("Caddyfile.validate", config.encode("utf-8"))
-            container.put_archive("/tmp", tar)
-            result = container.exec_run(
-                ["caddy", "validate", "--config", "/tmp/Caddyfile.validate", "--adapter", "caddyfile"],
-                demux=False,
-            )
-            container.exec_run(["rm", "-f", "/tmp/Caddyfile.validate"])
-            output = result.output.decode("utf-8", errors="replace").strip()
-            success = result.exit_code == 0
-            prefix = "✓ Valid" if success else "✗ Invalid"
-            return [TextContent(type="text", text=f"{prefix}\n{output}" if output else prefix)]
+def tool_status(arguments: dict) -> str:
+    container = get_container()
+    container.reload()
+    attrs = container.attrs or {}
+    state = attrs.get("State", {})
+    info = {
+        "name": container.name,
+        "status": container.status,
+        "id": container.short_id,
+        # Read the image off the container's own attrs: container.image is None
+        # when the image ID is missing from attrs, which turns `.tags` into an
+        # AttributeError.
+        "image": attrs.get("Config", {}).get("Image") or "unknown",
+        "running": state.get("Running", False),
+        "started_at": state.get("StartedAt", ""),
+        "restart_count": attrs.get("RestartCount", 0),
+    }
+    return json.dumps(info, indent=2)
 
-        # -- Reload ----------------------------------------------------------
-        elif name == "caddy_reload":
-            container = get_container()
-            result = container.exec_run(
-                [
-                    "caddy", "reload",
-                    "--config", CADDY_CONTAINER_CONFIG,
-                    "--adapter", "caddyfile",
-                ],
-                demux=False,
-            )
-            output = result.output.decode("utf-8", errors="replace").strip()
-            success = result.exit_code == 0
-            prefix = "✓ Caddy reloaded successfully" if success else "✗ Reload failed"
-            log.info("caddy reload: exit=%d", result.exit_code)
-            return [TextContent(type="text", text=f"{prefix}\n{output}" if output else prefix)]
 
-        # -- Logs ------------------------------------------------------------
-        elif name == "caddy_get_logs":
-            lines = int(arguments.get("lines", 100))
-            container = get_container()
-            logs = container.logs(tail=lines, timestamps=True).decode("utf-8", errors="replace")
-            return [TextContent(type="text", text=logs or "(no logs)")]
+TOOL_HANDLERS = {
+    "caddy_read_config": tool_read_config,
+    "caddy_write_config": tool_write_config,
+    "caddy_validate": tool_validate,
+    "caddy_reload": tool_reload,
+    "caddy_get_logs": tool_get_logs,
+    "caddy_status": tool_status,
+}
 
-        # -- Status ----------------------------------------------------------
-        elif name == "caddy_status":
-            container = get_container()
-            container.reload()
-            state = container.attrs.get("State", {})
-            tags = container.image.tags
-            info = {
-                "name": container.name,
-                "status": container.status,
-                "id": container.short_id,
-                "image": tags[0] if tags else "unknown",
-                "running": state.get("Running", False),
-                "started_at": state.get("StartedAt", ""),
-                "restart_count": container.attrs.get("RestartCount", 0),
-            }
-            return [TextContent(type="text", text=json.dumps(info, indent=2))]
 
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+def run_tool(name: str, arguments: dict) -> list:
+    """Dispatch a tool call and turn every failure into a readable MCP error."""
+    handler = TOOL_HANDLERS.get(name)
+    if handler is None:
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
+    try:
+        return [TextContent(type="text", text=handler(arguments or {}))]
+    except ToolError as exc:
+        log.warning("Tool %s failed: %s", name, exc)
+        return [TextContent(type="text", text=f"Error: {exc}")]
     except docker.errors.NotFound:
-        return [TextContent(type="text", text=f"Error: container '{CADDY_CONTAINER}' not found. Check CADDY_CONTAINER env var.")]
-    except FileNotFoundError:
-        return [TextContent(type="text", text=f"Error: Caddyfile not found at {CADDYFILE_PATH}. Check CADDYFILE_PATH env var.")]
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: container '{CADDY_CONTAINER}' not found. "
+                f"Check the CADDY_CONTAINER env var."
+            ),
+        )]
+    except FileNotFoundError as exc:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: a required path was not found ({exc}). The Docker socket "
+                f"is {DOCKER_SOCKET} (env DOCKER_SOCKET) and the Caddyfile is "
+                f"expected at {CADDY_CONTAINER_CONFIG} inside container "
+                f"'{CADDY_CONTAINER}' (env CADDY_CONTAINER_CONFIG)."
+            ),
+        )]
     except Exception as exc:
         log.exception("Tool error in %s", name)
         return [TextContent(type="text", text=f"Error: {exc}")]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list:
+    return run_tool(name, arguments)
 
 
 # ---------------------------------------------------------------------------
@@ -240,11 +526,10 @@ async def call_tool(name: str, arguments: dict) -> list:
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if MCP_API_KEY and request.url.path != "/health":
-            key = (
-                request.headers.get("x-api-key")
-                or request.query_params.get("api_key")
-            )
-            if key != MCP_API_KEY:
+            # Header only: a key in the query string ends up in reverse-proxy
+            # access logs, browser history and referrers.
+            key = request.headers.get("x-api-key") or ""
+            if not hmac.compare_digest(key, MCP_API_KEY):
                 return Response("Unauthorized", status_code=401)
         return await call_next(request)
 
@@ -268,7 +553,7 @@ def create_app() -> Starlette:
 
     async def health(_: Request):
         try:
-            docker_client.ping()
+            get_docker_client().ping()
             container = get_container()
             return Response(
                 json.dumps({"status": "ok", "caddy": container.status}),
@@ -306,4 +591,5 @@ if __name__ == "__main__":
     log.info("Caddy config   : %s", CADDY_CONTAINER_CONFIG)
     log.info("API key auth  : %s", "enabled" if MCP_API_KEY else "disabled")
     log.info("Root path     : %s", ROOT_PATH or "(none)")
+    log.info("Backups kept  : %d", BACKUP_KEEP)
     uvicorn.run(create_app(), host="0.0.0.0", port=PORT)
