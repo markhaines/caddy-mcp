@@ -126,8 +126,11 @@ def get_docker_client():
     fills only its own slot, so concurrent first use cannot build several
     clients and throw all but one away.
 
-    The count stays bounded — asyncio.to_thread uses the default executor,
-    capped around min(32, cpu + 4) threads.
+    In the current single-event-loop deployment the client count is bounded by
+    the default executor's worker count, normally min(32, cpu + 4). That bound
+    belongs to the default executor, not to asyncio.to_thread itself: an
+    application that installs its own executor via loop.set_default_executor()
+    would change it.
 
     Still lazy, and it must stay that way: constructing a client at import time
     turns an unreachable or unauthorised daemon into a crash loop (this one
