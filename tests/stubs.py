@@ -128,3 +128,18 @@ class StubContainer:
             return 0, ""
 
         return 127, f"{program}: not found"
+
+
+class StubDockerClient:
+    """Enough of a docker client for the /health endpoint."""
+
+    def __init__(self, container=None, ping_ok=True):
+        self.container = container
+        self.ping_ok = ping_ok
+        self.pings = 0
+
+    def ping(self):
+        self.pings += 1
+        if not self.ping_ok:
+            raise RuntimeError("docker daemon unreachable")
+        return True

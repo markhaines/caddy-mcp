@@ -1,13 +1,16 @@
 """Unit tests for the Caddy MCP server. No Docker daemon required."""
 
+import datetime
+import fnmatch
 import io
 import re
 import tarfile
 
 import pytest
+from starlette.testclient import TestClient
 
 import server
-from stubs import StubContainer
+from stubs import StubContainer, StubDockerClient
 
 CONFIG_PATH = server.CADDY_CONTAINER_CONFIG          # /etc/caddy/Caddyfile
 CONFIG_DIR = "/etc/caddy"
@@ -131,7 +134,7 @@ def test_write_backs_up_then_replaces_atomically(container):
     backups = _backups(container)
     assert len(backups) == 1
     assert re.fullmatch(
-        re.escape(CONFIG_PATH) + r"\.bak-\d{8}T\d{6}Z", backups[0]
+        re.escape(CONFIG_PATH) + r"\.bak-\d{8}T\d{6}Z-[0-9a-f]{8}", backups[0]
     ), backups[0]
     assert container.files[backups[0]] == LIVE_CONFIG.encode()
     assert container.files[CONFIG_PATH] == new_config.encode("utf-8")
@@ -310,6 +313,245 @@ def test_status_falls_back_when_the_image_is_unknown(monkeypatch):
 
 def test_unknown_tool(container):
     assert text_of(server.run_tool("nope", {})) == "Unknown tool: nope"
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — the rollback path (cleanup and restore are independent)
+# ---------------------------------------------------------------------------
+
+def test_rollback_still_runs_when_cleanup_raises(monkeypatch):
+    """Blocking 1: a raising `rm` used to jump past restore_backup() while the
+    response still claimed a rollback had been attempted."""
+    stub = use(monkeypatch, StubContainer(files={CONFIG_PATH: LIVE_CONFIG.encode()}))
+    stub.fail["mv"] = (1, "mv: can't rename: Read-only file system")
+    real_exec_run = stub.exec_run
+
+    def exec_run(cmd, demux=False):
+        # Only the staged-file cleanup explodes; validation's /tmp rm is fine.
+        if cmd[0] == "rm" and any(a.startswith(CONFIG_DIR) for a in cmd[1:]):
+            raise RuntimeError("docker exec died during cleanup")
+        return real_exec_run(cmd, demux=demux)
+
+    monkeypatch.setattr(stub, "exec_run", exec_run)
+
+    out = text_of(server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"}))
+
+    assert out.startswith("Error"), out
+    assert "Read-only file system" in out            # the original failure
+    assert "Cleanup FAILED" in out                   # cleanup outcome, honestly
+    assert "Rollback: restored" in out               # ...and the restore STILL ran
+    assert stub.files[CONFIG_PATH] == LIVE_CONFIG.encode()
+    # The restore actually happened, it was not merely claimed.
+    assert [c for c in stub.exec_calls if c[0] == "cp" and c[-1] == CONFIG_PATH]
+
+
+def test_cleanup_and_rollback_outcomes_are_reported_separately(monkeypatch):
+    """Blocking 2: a nonzero `rm` is surfaced, not discarded, and is clearly
+    distinct from the rollback outcome."""
+    stub = use(monkeypatch, StubContainer(files={CONFIG_PATH: LIVE_CONFIG.encode()}))
+    stub.fail["mv"] = (1, "mv: I/O error")
+    stub.fail["rm"] = (1, "rm: Permission denied")
+
+    out = text_of(server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"}))
+
+    lines = out.splitlines()
+    assert lines[0].startswith("Error: Write failed:")
+    assert "I/O error" in lines[0]
+    assert lines[1].startswith("Cleanup FAILED:")
+    assert "Permission denied" in lines[1]
+    assert lines[2].startswith("Rollback: restored")
+    assert stub.files[CONFIG_PATH] == LIVE_CONFIG.encode()
+
+
+def test_rollback_failure_is_never_reported_as_success(monkeypatch):
+    stub = use(monkeypatch, StubContainer(files={CONFIG_PATH: LIVE_CONFIG.encode()}))
+    stub.fail["mv"] = (1, "mv: I/O error")
+    real_exec_run = stub.exec_run
+
+    def exec_run(cmd, demux=False):
+        if cmd[0] == "cp" and cmd[-1] == CONFIG_PATH:
+            raise RuntimeError("docker exec died during rollback")
+        return real_exec_run(cmd, demux=demux)
+
+    monkeypatch.setattr(stub, "exec_run", exec_run)
+
+    out = text_of(server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"}))
+
+    assert "Rollback FAILED" in out
+    assert "MANUAL ACTION REQUIRED" in out
+    assert "Rollback: restored" not in out
+    assert "Cleanup: removed" in out          # cleanup did succeed, and says so
+
+
+def test_no_backup_is_reported_as_not_attempted(monkeypatch):
+    """With no pre-existing file there is nothing to restore — and the message
+    must say that, not imply a restore happened."""
+    stub = use(monkeypatch, StubContainer(files={}))
+    stub.fail["mv"] = (1, "mv: I/O error")
+
+    out = text_of(server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"}))
+
+    assert "Rollback: not attempted" in out
+    assert "Rollback: restored" not in out
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — backup naming and the prune glob (they move in lockstep)
+# ---------------------------------------------------------------------------
+
+# Real filenames sitting beside the live Caddyfile on the host. The prune glob
+# feeds `rm`, so matching any of these would delete someone's backup — and
+# matching the first would delete production.
+REAL_NEIGHBOURS = [
+    "Caddyfile",                       # THE LIVE CONFIG
+    "Caddyfile.backup",
+    "Caddyfile.bak-1778529190",
+    "Caddyfile.bak.20260617-113158",
+    "Caddyfile.bak-2026-08-15-095957",
+    "Caddyfile.bak.20260515-ipam",
+]
+
+
+def prune_pattern():
+    """The exact pattern prune_backups() hands to the shell."""
+    return f"{CONFIG_PATH}{server.BACKUP_SUFFIX_GLOB}"
+
+
+@pytest.mark.parametrize("name", REAL_NEIGHBOURS)
+def test_prune_glob_does_not_match_real_neighbouring_files(name):
+    assert not fnmatch.fnmatchcase(f"{CONFIG_DIR}/{name}", prune_pattern()), name
+
+
+def test_prune_glob_matches_the_names_we_generate(container):
+    """Generated names must stay inside the glob, or pruning silently stops."""
+    server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"})
+    server.run_tool("caddy_write_config", {"config": "b.example {\n}\n"})
+
+    backups = _backups(container)
+    assert len(backups) == 2
+    for backup in backups:
+        assert fnmatch.fnmatchcase(backup, prune_pattern()), backup
+
+
+def test_prune_glob_rejects_near_misses():
+    near_misses = [
+        f"{CONFIG_PATH}.bak-20260818T131500Z",            # the old, id-less form
+        f"{CONFIG_PATH}.bak-20260818T131500Z-",           # empty id
+        f"{CONFIG_PATH}.bak-20260818T131500Z-abcdefg",    # id too short
+        f"{CONFIG_PATH}.bak-20260818T131500Z-abcdefghi",  # id too long
+        f"{CONFIG_PATH}.bak-20260818T131500Z-ABCDEF12",   # not lowercase hex
+        f"{CONFIG_PATH}.bak-20260818T131500Z-abcdefgh",   # 'g'/'h' are not hex
+        f"{CONFIG_PATH}.bak-2026081T131500Z-abcdef12",    # short timestamp
+    ]
+    for name in near_misses:
+        assert not fnmatch.fnmatchcase(name, prune_pattern()), name
+
+
+def test_backup_names_do_not_collide_within_one_second(container, monkeypatch):
+    """One-second stamps alone let two writes share a backup path and clobber
+    each other's rollback source."""
+    frozen = datetime.datetime(2026, 8, 18, 13, 15, 0, tzinfo=datetime.timezone.utc)
+
+    class FrozenClock:
+        @staticmethod
+        def now(tz=None):
+            return frozen if tz is None else frozen.astimezone(tz)
+
+    monkeypatch.setattr(server, "datetime", FrozenClock)
+
+    server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"})
+    server.run_tool("caddy_write_config", {"config": "b.example {\n}\n"})
+
+    backups = _backups(container)
+    assert len(backups) == 2, backups
+    assert len(set(backups)) == 2
+    stamps = {b.rsplit("-", 1)[0] for b in backups}
+    assert len(stamps) == 1, "the test did not actually freeze the clock"
+    # The first backup still holds the config that existed before write one.
+    assert LIVE_CONFIG.encode() in [container.files[b] for b in backups]
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — backup absence must not be inferred from an arbitrary failure
+# ---------------------------------------------------------------------------
+
+def test_write_refuses_when_the_existence_check_fails(monkeypatch):
+    stub = use(monkeypatch, StubContainer(files={CONFIG_PATH: LIVE_CONFIG.encode()}))
+    stub.fail["test"] = (127, "test: applet not found")
+
+    out = text_of(server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"}))
+
+    assert out.startswith("Error"), out
+    assert "Not writing without a backup" in out
+    assert [c for c in stub.put_archive_calls if c["path"] == CONFIG_DIR] == []
+    assert stub.files[CONFIG_PATH] == LIVE_CONFIG.encode()
+
+
+def test_write_proceeds_without_a_backup_when_there_is_genuinely_no_config(monkeypatch):
+    stub = use(monkeypatch, StubContainer(files={}))
+
+    out = text_of(server.run_tool("caddy_write_config", {"config": "a.example {\n}\n"}))
+
+    assert out.startswith("✓"), out
+    assert "Backup: none" in out
+    assert stub.files[CONFIG_PATH] == b"a.example {\n}\n"
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — API key middleware
+# ---------------------------------------------------------------------------
+
+API_KEY = "s3cret-test-key"
+
+
+@pytest.fixture
+def client(monkeypatch, container):
+    monkeypatch.setattr(server, "MCP_API_KEY", API_KEY)
+    monkeypatch.setattr(server, "get_docker_client", lambda: StubDockerClient(container))
+    return TestClient(server.create_app(), raise_server_exceptions=False)
+
+
+def test_api_key_matches_rejects_non_ascii_without_raising(monkeypatch):
+    """hmac.compare_digest refuses non-ASCII str arguments; this must be a
+    non-match, not a TypeError."""
+    monkeypatch.setattr(server, "MCP_API_KEY", API_KEY)
+
+    with pytest.raises(TypeError):
+        __import__("hmac").compare_digest("café", API_KEY)   # the old comparison
+
+    assert server.api_key_matches("café") is False
+    assert server.api_key_matches(None) is False
+    assert server.api_key_matches("") is False
+    assert server.api_key_matches(API_KEY) is True
+
+
+def test_non_ascii_header_is_401_not_500(client):
+    response = client.get("/anything", headers={"x-api-key": "café".encode("utf-8")})
+    assert response.status_code == 401
+
+
+def test_query_string_credential_is_rejected(client):
+    """The api_key query param was removed: it leaks into proxy access logs."""
+    assert client.get(f"/anything?api_key={API_KEY}").status_code == 401
+
+
+def test_missing_header_is_401(client):
+    assert client.get("/anything").status_code == 401
+
+
+def test_wrong_header_is_401(client):
+    assert client.get("/anything", headers={"x-api-key": "nope"}).status_code == 401
+
+
+def test_valid_header_passes_the_middleware(client):
+    # 404 rather than 401: authentication passed and routing took over.
+    assert client.get("/anything", headers={"x-api-key": API_KEY}).status_code == 404
+
+
+def test_health_is_exempt_from_auth(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
 
 
 # ---------------------------------------------------------------------------

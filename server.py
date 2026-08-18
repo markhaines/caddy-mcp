@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import tarfile
+import threading
 import uuid
 from datetime import datetime, timezone
 
@@ -44,10 +45,27 @@ ROOT_PATH = os.environ.get("ROOT_PATH", "").rstrip("/")
 
 # How many of our own timestamped backups to keep beside the live Caddyfile.
 BACKUP_KEEP = int(os.environ.get("CADDY_BACKUP_KEEP", "10"))
-# Backups this server writes are named <config>.bak-YYYYmmddTHHMMSSZ. Pruning
-# only ever matches that exact shape, so hand-made backups sitting in the same
-# directory under other naming schemes are never touched.
-BACKUP_SUFFIX_GLOB = ".bak-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z"
+# Backups this server writes are named
+#     <config>.bak-YYYYmmddTHHMMSSZ-<8 lowercase hex>
+# The timestamp sorts lexicographically (so `sort -r` is newest-first) and the
+# random id makes two writes within the same second collision-proof — without
+# it they would share a path and could overwrite each other's rollback source.
+BACKUP_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+BACKUP_ID_CHARS = 8
+_DIGIT = "[0-9]"
+_HEX = "[0-9a-f]"
+# SAFETY-CRITICAL: this glob feeds `rm`. It must match the shape above exactly
+# and nothing else — in particular not the live Caddyfile itself and not the
+# hand-made backups beside it (Caddyfile.backup, Caddyfile.bak-1778529190,
+# Caddyfile.bak.20260617-113158, Caddyfile.bak-2026-08-15-095957,
+# Caddyfile.bak.20260515-ipam). Keep it in lockstep with the name built in
+# backup_config(); tests/test_server.py pins both.
+BACKUP_SUFFIX_GLOB = (
+    ".bak-" + _DIGIT * 8 + "T" + _DIGIT * 6 + "Z-" + _HEX * BACKUP_ID_CHARS
+)
+# `test -f` exits 1 for "no such file"; anything else (2, 126, 127, ...) means
+# the check itself failed and absence must not be inferred from it.
+TEST_F_ABSENT_EXIT = 1
 
 LOG_LINES_DEFAULT = 100
 LOG_LINES_MIN = 1
@@ -56,6 +74,9 @@ LOG_LINES_MAX = 2000
 server = Server("caddy-mcp")
 
 _docker_client = None
+# Serialises the write transaction so two callers cannot interleave
+# backup/stage/rename against the same file.
+_write_lock = threading.Lock()
 
 
 class ToolError(Exception):
@@ -173,26 +194,45 @@ def validate_config(container, config: str) -> tuple:
         )
         return exit_code == 0, output.strip()
     finally:
-        cleanup_code, cleanup_output = exec_in_container(container, ["rm", "-f", staged])
-        if cleanup_code != 0:
-            log.warning(
-                "Failed to remove validation temp file %s (exit %d): %s",
-                staged, cleanup_code, cleanup_output.strip(),
-            )
+        # Best-effort, and deliberately swallowed: a cleanup problem must not
+        # replace the validation result on the way out of this finally.
+        try:
+            cleanup_code, cleanup_output = exec_in_container(container, ["rm", "-f", staged])
+            if cleanup_code != 0:
+                log.warning(
+                    "Failed to remove validation temp file %s (exit %d): %s",
+                    staged, cleanup_code, cleanup_output.strip(),
+                )
+        except Exception as cleanup_exc:
+            log.warning("Failed to remove validation temp file %s: %s", staged, cleanup_exc)
 
 
 def backup_config(container) -> str:
     """Copy the live Caddyfile aside. Returns the backup path, or "" if there
     was no existing file to back up."""
-    exists_code, _ = exec_in_container(container, ["test", "-f", CADDY_CONTAINER_CONFIG])
-    if exists_code != 0:
+    exists_code, exists_output = exec_in_container(
+        container, ["test", "-f", CADDY_CONTAINER_CONFIG]
+    )
+    if exists_code == TEST_F_ABSENT_EXIT:
         log.warning(
             "No existing file at %s to back up before writing", CADDY_CONTAINER_CONFIG
         )
         return ""
+    if exists_code != 0:
+        # An exec, permission or PATH problem is not evidence of absence, and
+        # proceeding would write unprotected at exactly the wrong moment.
+        raise ToolError(
+            f"Refusing to write: could not determine whether "
+            f"{CADDY_CONTAINER_CONFIG} exists in container '{CADDY_CONTAINER}' "
+            f"(`test -f` exited {exists_code}, expected 0 or "
+            f"{TEST_F_ABSENT_EXIT}): {exists_output.strip() or '(no output)'}. "
+            f"Not writing without a backup. The live config is unchanged."
+        )
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = f"{CADDY_CONTAINER_CONFIG}.bak-{stamp}"
+    stamp = datetime.now(timezone.utc).strftime(BACKUP_STAMP_FORMAT)
+    backup = (
+        f"{CADDY_CONTAINER_CONFIG}.bak-{stamp}-{uuid.uuid4().hex[:BACKUP_ID_CHARS]}"
+    )
     exit_code, output = exec_in_container(
         container, ["cp", "-p", CADDY_CONTAINER_CONFIG, backup]
     )
@@ -226,8 +266,8 @@ def restore_backup(container, backup: str) -> str:
     """Put a backup back over the live config. Returns a human-readable outcome."""
     if not backup:
         return (
-            "Rollback: no backup existed (there was no file at "
-            f"{CADDY_CONTAINER_CONFIG} beforehand), so nothing was restored."
+            "Rollback: not attempted — no backup existed (there was no file at "
+            f"{CADDY_CONTAINER_CONFIG} beforehand), so there was nothing to restore."
         )
     exit_code, output = exec_in_container(
         container, ["cp", "-p", backup, CADDY_CONTAINER_CONFIG]
@@ -244,7 +284,59 @@ def restore_backup(container, backup: str) -> str:
     return f"Rollback: restored {CADDY_CONTAINER_CONFIG} from {backup}."
 
 
+def cleanup_staged(container, staged_path: str) -> str:
+    """Remove a staged temp file, reporting the outcome. Never raises.
+
+    Cleanup is independent of rollback: a stale temp file is untidy, a
+    Caddyfile left broken is an outage, so nothing here may stop a restore.
+    """
+    try:
+        exit_code, output = exec_in_container(container, ["rm", "-f", staged_path])
+    except Exception as exc:
+        log.warning("Could not remove staged file %s: %s", staged_path, exc)
+        return (
+            f"Cleanup FAILED: removing the staged file {staged_path} raised "
+            f"{exc!r}. A stale temp file may remain in the Caddy config directory."
+        )
+    if exit_code != 0:
+        log.warning(
+            "Could not remove staged file %s (rm exited %d): %s",
+            staged_path, exit_code, output.strip(),
+        )
+        return (
+            f"Cleanup FAILED: could not remove the staged file {staged_path} "
+            f"(rm exited {exit_code}): {output.strip() or '(no output)'}. A stale "
+            f"temp file may remain in the Caddy config directory."
+        )
+    return f"Cleanup: removed the staged file {staged_path}."
+
+
+def rollback_to_backup(container, backup: str) -> str:
+    """restore_backup() that cannot raise, so the reported outcome is always
+    the outcome that actually happened."""
+    try:
+        return restore_backup(container, backup)
+    except Exception as exc:
+        log.error("Rollback from %s raised: %s", backup or "(no backup)", exc)
+        return (
+            f"Rollback FAILED: restoring {backup or '(no backup)'} raised {exc!r}. "
+            f"MANUAL ACTION REQUIRED — the live config may be in an unknown state"
+            + (f"; the backup is at {backup}." if backup else ".")
+        )
+
+
 def write_config(container, config: str) -> str:
+    """Serialised entry point for the write transaction.
+
+    Two writes interleaving would race on the backup/stage/rename sequence and
+    could restore the wrong content, so the whole transaction is taken under a
+    lock.
+    """
+    with _write_lock:
+        return write_config_locked(container, config)
+
+
+def write_config_locked(container, config: str) -> str:
     """Validate, back up, then atomically replace the live Caddyfile.
 
     Order matters: the exact bytes that will be committed are validated first,
@@ -285,17 +377,15 @@ def write_config(container, config: str) -> str:
                 f"{output.strip() or '(no output)'}."
             )
     except Exception as exc:
-        # Never let a cleanup failure hide the failure that caused it.
-        try:
-            exec_in_container(container, ["rm", "-f", staged_path])
-            rollback = restore_backup(container, backup)
-        except Exception as rollback_exc:
-            rollback = (
-                f"Rollback FAILED: {rollback_exc}. MANUAL ACTION REQUIRED — "
-                f"the live config may be in an unknown state"
-                + (f"; a backup is at {backup}." if backup else ".")
-            )
-        raise ToolError(f"Write failed: {exc}\n{rollback}") from exc
+        # Three separate outcomes, reported separately and truthfully: the
+        # failure itself, whether the staged file was cleaned up, and whether
+        # the live config was actually restored. Neither helper raises, so a
+        # cleanup problem can never skip the rollback (or be mistaken for one).
+        cleanup_outcome = cleanup_staged(container, staged_path)
+        rollback_outcome = rollback_to_backup(container, backup)
+        raise ToolError(
+            f"Write failed: {exc}\n{cleanup_outcome}\n{rollback_outcome}"
+        ) from exc
 
     log.info(
         "Caddyfile written to %s in container (%d bytes, backup %s)",
@@ -523,13 +613,28 @@ async def call_tool(name: str, arguments: dict) -> list:
 # HTTP app (SSE transport + optional API key auth)
 # ---------------------------------------------------------------------------
 
+def api_key_matches(provided) -> bool:
+    """Constant-time credential check that cannot raise.
+
+    hmac.compare_digest refuses str arguments containing non-ASCII characters
+    (TypeError), so a header like `x-api-key: café` would otherwise surface as
+    a 500 with a stack trace. Compare encoded bytes instead, and treat anything
+    that will not encode — or is missing entirely — as simply not a match.
+    """
+    try:
+        return hmac.compare_digest(
+            (provided or "").encode("utf-8"), MCP_API_KEY.encode("utf-8")
+        )
+    except (AttributeError, TypeError, UnicodeError):
+        return False
+
+
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if MCP_API_KEY and request.url.path != "/health":
             # Header only: a key in the query string ends up in reverse-proxy
             # access logs, browser history and referrers.
-            key = request.headers.get("x-api-key") or ""
-            if not hmac.compare_digest(key, MCP_API_KEY):
+            if not api_key_matches(request.headers.get("x-api-key")):
                 return Response("Unauthorized", status_code=401)
         return await call_next(request)
 
