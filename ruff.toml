@@ -1,0 +1,18 @@
+# Lint gate for CI. The rule set is pinned explicitly rather than left to ruff's
+# defaults, which widen between releases: a ruff upgrade should never turn a green
+# repo red on rules nobody chose.
+#
+#   E, W  pycodestyle    F  pyflakes (real bugs)
+#   I     import order    B  bugbear (bug-shaped patterns, e.g. B023 loop-variable capture)
+line-length = 110
+
+[lint]
+select = ["E", "F", "W", "I", "B"]
+# Long lines are a judgement call, and the codebase has readable ones over the limit.
+# Everything else in E/W is mechanical, so it stays on.
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# Tests build fixtures inline and shadow names deliberately.
+"tests/*" = ["B007"]
+"test_*.py" = ["B007"]

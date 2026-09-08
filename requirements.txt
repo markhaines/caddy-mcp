@@ -1,4 +1,10 @@
-mcp>=1.0.0
+# PINNED 2026-09-08. `mcp>=1.0.0` was unpinned, and a rebuild that day resolved to
+# mcp 2.2.0, which removes the low-level `@server.list_tools()` / `@server.call_tool()`
+# decorator API this server is built on. The container crash-looped on
+# `AttributeError: 'Server' object has no attribute 'list_tools'`.
+# 1.27.0 is the version that was running before, and it has
+# StreamableHTTPSessionManager. Migrating to the 2.x API is a separate job.
+mcp==1.27.0
 docker>=7.0.0
 uvicorn>=0.30.0
 starlette>=0.40.0

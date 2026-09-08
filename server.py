@@ -5,6 +5,7 @@ Provides Claude with tools to manage a Caddy reverse proxy via the Docker API.
 Runs as a container on the same host as Caddy, using the local Docker socket.
 """
 
+import contextlib
 import io
 import json
 import logging
@@ -15,12 +16,14 @@ import docker
 import uvicorn
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import TextContent, Tool
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount, Route
+from starlette.types import ASGIApp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("caddy-mcp")
@@ -39,8 +42,24 @@ PORT = int(os.environ.get("PORT", "8000"))
 # which the client then POSTs back to via the same reverse proxy.
 ROOT_PATH = os.environ.get("ROOT_PATH", "").rstrip("/")
 
-docker_client = docker.DockerClient(base_url=DOCKER_SOCKET)
 server = Server("caddy-mcp")
+
+# The Docker client is created on first use, not at import.
+#
+# It used to be a module-level `docker.DockerClient(...)`, which connects to the
+# daemon immediately. That made the module impossible to import anywhere without a
+# running Docker socket, tests included: `import server` raised DockerException
+# before a single line of test code ran. Nothing about parsing a Caddyfile or
+# checking an API key needs a daemon.
+_docker_client = None
+
+
+def get_docker_client():
+    """The shared Docker client, connected on first use."""
+    global _docker_client
+    if _docker_client is None:
+        _docker_client = docker.DockerClient(base_url=DOCKER_SOCKET)
+    return _docker_client
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +68,7 @@ server = Server("caddy-mcp")
 
 def get_container():
     """Get the Caddy container, raising a clear error if not found."""
-    return docker_client.containers.get(CADDY_CONTAINER)
+    return get_docker_client().containers.get(CADDY_CONTAINER)
 
 
 def pack_tar(filename: str, content: bytes) -> io.BytesIO:
@@ -227,15 +246,38 @@ async def call_tool(name: str, arguments: dict) -> list:
     except docker.errors.NotFound:
         return [TextContent(type="text", text=f"Error: container '{CADDY_CONTAINER}' not found. Check CADDY_CONTAINER env var.")]
     except FileNotFoundError:
-        return [TextContent(type="text", text=f"Error: Caddyfile not found at {CADDYFILE_PATH}. Check CADDYFILE_PATH env var.")]
+        return [TextContent(type="text", text=f"Error: Caddyfile not found at {CADDY_CONTAINER_CONFIG}. Check CADDY_CONTAINER_CONFIG env var.")]
     except Exception as exc:
         log.exception("Tool error in %s", name)
         return [TextContent(type="text", text=f"Error: {exc}")]
 
 
 # ---------------------------------------------------------------------------
-# HTTP app (SSE transport + optional API key auth)
+# HTTP app (Streamable HTTP + legacy SSE, optional API key auth)
 # ---------------------------------------------------------------------------
+
+class NormalizeMcpPath:
+    """Serve `/mcp` as `/mcp/` in-process rather than redirecting to it.
+
+    Starlette's `Mount("/mcp", ...)` answers a bare `/mcp` with a 307 to `/mcp/`.
+    That Location is root-relative, so behind a reverse proxy that mounts this
+    server under a prefix (mcp-lan.hainesy.com/caddy/*) the client follows it to
+    `https://mcp-lan.hainesy.com/mcp/` and escapes the prefix entirely. It is the
+    same root-relative escape that made the old SSE transport unroutable under a
+    path, so fixing the transport without fixing this would just move the bug.
+
+    Rewriting the path inside the ASGI scope keeps both `/mcp` and `/mcp/`
+    working over any prefix, with no redirect on the wire.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") == "/mcp":
+            scope = dict(scope, path="/mcp/", raw_path=b"/mcp/")
+        await self.app(scope, receive, send)
+
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -249,7 +291,9 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def create_app() -> Starlette:
+def create_app() -> ASGIApp:
+    # Returns the NormalizeMcpPath wrapper around the Starlette app, not the Starlette
+    # app itself, so the annotation is the ASGI callable rather than Starlette.
     # If the server sits behind a reverse proxy at ROOT_PATH, the SSE transport
     # must emit endpoint URLs that include the prefix so the client POSTs back
     # via the same proxy. The Mount path stays at /messages/ because the proxy
@@ -268,7 +312,7 @@ def create_app() -> Starlette:
 
     async def health(_: Request):
         try:
-            docker_client.ping()
+            get_docker_client().ping()
             container = get_container()
             return Response(
                 json.dumps({"status": "ok", "caddy": container.status}),
@@ -281,18 +325,45 @@ def create_app() -> Starlette:
                 media_type="application/json",
             )
 
+    # Streamable HTTP (the current standard transport). Single endpoint, so
+    # unlike SSE it emits no root-relative callback URL and needs no ROOT_PATH
+    # fix-up: it works unchanged behind any path prefix. Stateless because these
+    # tools are all short request/response, which keeps it robust behind a proxy
+    # with no session affinity to preserve.
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        event_store=None,
+        json_response=False,
+        stateless=True,
+    )
+
+    async def handle_streamable_http(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with session_manager.run():
+            yield
+
     app = Starlette(
         routes=[
+            Mount("/mcp", app=handle_streamable_http),
+            # Legacy HTTP+SSE. Retained only so an un-migrated client keeps
+            # working; the MCP spec no longer defines this transport. Remove
+            # once nothing points at /sse.
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
             Route("/health", endpoint=health),
-        ]
+        ],
+        lifespan=lifespan,
     )
 
     if MCP_API_KEY:
         app.add_middleware(ApiKeyMiddleware)
 
-    return app
+    # Outermost: rewrites a bare /mcp before routing. Lifespan events pass
+    # straight through, so the session manager still starts and stops normally.
+    return NormalizeMcpPath(app)
 
 
 # ---------------------------------------------------------------------------
@@ -306,4 +377,5 @@ if __name__ == "__main__":
     log.info("Caddy config   : %s", CADDY_CONTAINER_CONFIG)
     log.info("API key auth  : %s", "enabled" if MCP_API_KEY else "disabled")
     log.info("Root path     : %s", ROOT_PATH or "(none)")
+    log.info("Endpoints     : /mcp (streamable-http), /sse (legacy), /health")
     uvicorn.run(create_app(), host="0.0.0.0", port=PORT)
