@@ -82,6 +82,30 @@ def pack_tar(filename: str, content: bytes) -> io.BytesIO:
     return buf
 
 
+def _is_missing_container(exc: docker.errors.NotFound) -> bool:
+    """Docker also answers 404 "No such container" if the container went away
+    (removed or recreated) after get_container(). That is not a path problem, so
+    it goes to the outer "container not found" handler instead."""
+    return "no such container" in str(exc).lower()
+
+
+def _missing_path_error(directory: str, exc: docker.errors.NotFound) -> str:
+    """Docker answers put_archive to a missing directory with a 404 (NotFound).
+
+    That is a path problem, not a missing container, so say which path and which
+    setting controls it.
+    """
+    hint = (
+        "Check CADDY_CONTAINER_CONFIG env var"
+        if directory == os.path.dirname(CADDY_CONTAINER_CONFIG)
+        else "It must exist inside the container"
+    )
+    return (
+        f"Error: directory {directory} not found in container '{CADDY_CONTAINER}' "
+        f"(Caddyfile path {CADDY_CONTAINER_CONFIG}). {hint}. Docker said: {exc}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # MCP tool definitions
 # ---------------------------------------------------------------------------
@@ -169,6 +193,14 @@ async def call_tool(name: str, arguments: dict) -> list:
             container = get_container()
             result = container.exec_run(["cat", CADDY_CONTAINER_CONFIG], demux=False)
             content = result.output.decode("utf-8", errors="replace")
+            # exec_run does not raise when cat fails, so the exit code is the only
+            # signal. Never hand cat's error text back as if it were the config.
+            if result.exit_code != 0:
+                return [TextContent(type="text", text=(
+                    f"Error: could not read the Caddyfile at {CADDY_CONTAINER_CONFIG} "
+                    f"(cat exited {result.exit_code}). No config was returned. "
+                    f"Check CADDY_CONTAINER_CONFIG env var.\n{content.strip()}"
+                ))]
             return [TextContent(type="text", text=content)]
 
         # -- Write Caddyfile -------------------------------------------------
@@ -178,7 +210,12 @@ async def call_tool(name: str, arguments: dict) -> list:
             filename = os.path.basename(CADDY_CONTAINER_CONFIG)
             directory = os.path.dirname(CADDY_CONTAINER_CONFIG)
             tar = pack_tar(filename, config.encode("utf-8"))
-            container.put_archive(directory, tar)
+            try:
+                container.put_archive(directory, tar)
+            except docker.errors.NotFound as exc:
+                if _is_missing_container(exc):
+                    raise
+                return [TextContent(type="text", text=_missing_path_error(directory, exc))]
             log.info("Caddyfile written to %s in container", CADDY_CONTAINER_CONFIG)
             return [TextContent(type="text", text="✓ Caddyfile written. Call caddy_reload to apply.")]
 
@@ -188,7 +225,12 @@ async def call_tool(name: str, arguments: dict) -> list:
             container = get_container()
             # Copy config into the container at a temp path, validate, then clean up.
             tar = pack_tar("Caddyfile.validate", config.encode("utf-8"))
-            container.put_archive("/tmp", tar)
+            try:
+                container.put_archive("/tmp", tar)
+            except docker.errors.NotFound as exc:
+                if _is_missing_container(exc):
+                    raise
+                return [TextContent(type="text", text=_missing_path_error("/tmp", exc))]
             result = container.exec_run(
                 ["caddy", "validate", "--config", "/tmp/Caddyfile.validate", "--adapter", "caddyfile"],
                 demux=False,
@@ -244,9 +286,9 @@ async def call_tool(name: str, arguments: dict) -> list:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     except docker.errors.NotFound:
+        # A 404 from a file operation is caught at its call site, so what reaches
+        # here is the container lookup itself.
         return [TextContent(type="text", text=f"Error: container '{CADDY_CONTAINER}' not found. Check CADDY_CONTAINER env var.")]
-    except FileNotFoundError:
-        return [TextContent(type="text", text=f"Error: Caddyfile not found at {CADDY_CONTAINER_CONFIG}. Check CADDY_CONTAINER_CONFIG env var.")]
     except Exception as exc:
         log.exception("Tool error in %s", name)
         return [TextContent(type="text", text=f"Error: {exc}")]
@@ -309,6 +351,10 @@ def create_app() -> ASGIApp:
                 streams[1],
                 server.create_initialization_options(),
             )
+        # Starlette calls the endpoint's return value as the ASGI response, so
+        # returning None raised TypeError (a 500) every time a session ended. This
+        # is the pattern the MCP SDK's own SseServerTransport docs use.
+        return Response()
 
     async def health(_: Request):
         try:

@@ -6,12 +6,18 @@ used to be built at import time, so `import server` raised before any test ran.
 The API-key middleware gets the most attention: it is the only thing standing between
 the internet-facing proxy and a tool that rewrites the reverse proxy's config.
 """
+import asyncio
+import contextlib
 import importlib
+import json
 import os
 import sys
 import tarfile
+from pathlib import Path
 
+import docker
 import pytest
+from docker.models.containers import ExecResult
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
@@ -145,21 +151,176 @@ def test_the_key_is_also_accepted_in_a_query_string():
 # --- error handling ------------------------------------------------------------------
 
 
-def test_a_missing_caddyfile_reports_an_error_instead_of_crashing_the_handler(monkeypatch):
-    """Regression: the FileNotFoundError branch referenced CADDYFILE_PATH.
+class FakeContainer:
+    """Stands in for a docker-py Container. Records calls; no daemon needed."""
 
-    The config variable was renamed to CADDY_CONTAINER_CONFIG everywhere else, so
-    this one line raised NameError from inside the except block. The handler written
-    to explain the problem was the thing that broke, and only at the moment it was
-    needed.
+    def __init__(self, exec_results=None, put_archive_error=None):
+        self.exec_results = exec_results or {}
+        self.put_archive_error = put_archive_error
+        self.put_archive_calls = []
+        self.exec_calls = []
+
+    def exec_run(self, cmd, **_kwargs):
+        self.exec_calls.append(cmd)
+        return self.exec_results.get(cmd[0], ExecResult(0, b""))
+
+    def put_archive(self, path, data):
+        self.put_archive_calls.append(path)
+        if self.put_archive_error is not None:
+            raise self.put_archive_error
+        return True
+
+
+def _call(name, arguments=None):
+    return asyncio.run(srv.call_tool(name, arguments or {}))[0].text
+
+
+def test_a_failed_cat_is_reported_as_an_error_not_returned_as_the_config(monkeypatch):
+    """exec_run does not raise when cat fails: it returns a non-zero exit code.
+
+    Returning that output as the config hands the caller an error message to edit
+    and write back over the live Caddyfile.
     """
-    import asyncio
+    cat_error = b"cat: can't open '/etc/caddy/Caddyfile': No such file or directory\n"
+    fake = FakeContainer(exec_results={"cat": ExecResult(1, cat_error)})
+    monkeypatch.setattr(srv, "get_container", lambda: fake)
 
-    def _boom(*_a, **_k):
-        raise FileNotFoundError("no Caddyfile")
+    text = _call("caddy_read_config")
 
-    monkeypatch.setattr(srv, "get_container", _boom)
-    result = asyncio.run(srv.call_tool("caddy_read_config", {}))
-    text = result[0].text
-    assert "Error" in text
+    assert text.startswith("Error:")
+    assert "CADDY_CONTAINER_CONFIG" in text
     assert srv.CADDY_CONTAINER_CONFIG in text
+
+
+def test_a_successful_cat_returns_the_config_unchanged(monkeypatch):
+    config = b"example.com {\n\trespond \"hi\"\n}\n"
+    fake = FakeContainer(exec_results={"cat": ExecResult(0, config)})
+    monkeypatch.setattr(srv, "get_container", lambda: fake)
+
+    assert _call("caddy_read_config") == config.decode()
+
+
+def _missing_path():
+    return docker.errors.NotFound("Could not find the file /etc/caddy in container caddy")
+
+
+def test_a_missing_config_directory_on_write_names_the_path_not_the_container(monkeypatch):
+    """Docker answers put_archive to a missing directory with a 404 (NotFound)."""
+    fake = FakeContainer(put_archive_error=_missing_path())
+    monkeypatch.setattr(srv, "get_container", lambda: fake)
+
+    text = _call("caddy_write_config", {"config": "example.com {\n}\n"})
+
+    assert text.startswith("Error:")
+    assert "CADDY_CONTAINER_CONFIG" in text
+    assert os.path.dirname(srv.CADDY_CONTAINER_CONFIG) in text
+    assert "CADDY_CONTAINER env var" not in text
+
+
+def test_a_missing_tmp_on_validate_names_tmp_not_the_container(monkeypatch):
+    fake = FakeContainer(put_archive_error=_missing_path())
+    monkeypatch.setattr(srv, "get_container", lambda: fake)
+
+    text = _call("caddy_validate", {"config": "example.com {\n}\n"})
+
+    assert text.startswith("Error:")
+    assert "/tmp" in text
+    assert "CADDY_CONTAINER env var" not in text
+
+
+@pytest.mark.parametrize("tool", ["caddy_write_config", "caddy_validate"])
+def test_container_gone_at_put_archive_is_not_reported_as_a_missing_directory(monkeypatch, tool):
+    """Docker also answers put_archive with a 404 when the container itself is gone.
+
+    That happens if the container is removed or recreated between get_container()
+    and put_archive. It must not send the user to check the config path.
+    """
+    fake = FakeContainer(put_archive_error=docker.errors.NotFound("No such container: abc123"))
+    monkeypatch.setattr(srv, "get_container", lambda: fake)
+
+    text = _call(tool, {"config": "x"})
+
+    assert text == (
+        f"Error: container '{srv.CADDY_CONTAINER}' not found. Check CADDY_CONTAINER env var."
+    ), text
+
+
+def test_a_missing_container_still_reports_container_not_found(monkeypatch):
+    class FakeContainers:
+        def get(self, _name):
+            raise docker.errors.NotFound("No such container: caddy")
+
+    class FakeClient:
+        containers = FakeContainers()
+
+    monkeypatch.setattr(srv, "get_docker_client", lambda: FakeClient())
+
+    for tool, args in [
+        ("caddy_read_config", {}),
+        ("caddy_write_config", {"config": "x"}),
+        ("caddy_validate", {"config": "x"}),
+    ]:
+        text = _call(tool, args)
+        assert text == (
+            f"Error: container '{srv.CADDY_CONTAINER}' not found. Check CADDY_CONTAINER env var."
+        ), tool
+
+
+# --- legacy SSE endpoint -------------------------------------------------------------
+
+
+def test_sse_session_ending_does_not_raise_or_return_500(monkeypatch):
+    """Starlette calls whatever a Route endpoint returns as the ASGI response.
+
+    handle_sse returned None, so every legacy-SSE session that ended raised
+    `TypeError: 'NoneType' object is not callable` and answered 500.
+    """
+    class FakeSseTransport:
+        def __init__(self, endpoint):
+            self.endpoint = endpoint
+
+        @contextlib.asynccontextmanager
+        async def connect_sse(self, scope, receive, send):
+            yield (None, None)
+
+        async def handle_post_message(self, scope, receive, send):
+            raise AssertionError("not used")
+
+    async def fake_run(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(srv, "SseServerTransport", FakeSseTransport)
+    monkeypatch.setattr(srv.server, "run", fake_run)
+
+    # raise_server_exceptions defaults to True, so the TypeError would surface here.
+    with TestClient(srv.create_app()) as client:
+        r = client.get("/sse")
+    assert r.status_code == 200
+
+
+# --- README matches the tools ---------------------------------------------------------
+
+
+def test_readme_tools_table_matches_what_caddy_status_returns(monkeypatch):
+    """caddy_status returns `started_at`, not an uptime, so the README must not say uptime."""
+    class FakeImage:
+        tags = ["caddy:2"]
+
+    class StatusContainer:
+        name = "caddy"
+        status = "running"
+        short_id = "abc123"
+        image = FakeImage()
+        attrs = {"State": {"Running": True, "StartedAt": "2026-11-05T00:00:00Z"}, "RestartCount": 0}
+
+        def reload(self):
+            pass
+
+    monkeypatch.setattr(srv, "get_container", lambda: StatusContainer())
+    info = json.loads(_call("caddy_status"))
+    assert "uptime" not in info and "started_at" in info
+
+    readme = Path(__file__).resolve().parent.parent / "README.md"
+    row = next(line for line in readme.read_text().splitlines() if line.startswith("| `caddy_status`"))
+    assert "uptime" not in row.lower()
+    assert "start time" in row.lower()
