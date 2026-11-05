@@ -228,6 +228,23 @@ def test_a_missing_tmp_on_validate_names_tmp_not_the_container(monkeypatch):
     assert "CADDY_CONTAINER env var" not in text
 
 
+@pytest.mark.parametrize("tool", ["caddy_write_config", "caddy_validate"])
+def test_container_gone_at_put_archive_is_not_reported_as_a_missing_directory(monkeypatch, tool):
+    """Docker also answers put_archive with a 404 when the container itself is gone.
+
+    That happens if the container is removed or recreated between get_container()
+    and put_archive. It must not send the user to check the config path.
+    """
+    fake = FakeContainer(put_archive_error=docker.errors.NotFound("No such container: abc123"))
+    monkeypatch.setattr(srv, "get_container", lambda: fake)
+
+    text = _call(tool, {"config": "x"})
+
+    assert text == (
+        f"Error: container '{srv.CADDY_CONTAINER}' not found. Check CADDY_CONTAINER env var."
+    ), text
+
+
 def test_a_missing_container_still_reports_container_not_found(monkeypatch):
     class FakeContainers:
         def get(self, _name):

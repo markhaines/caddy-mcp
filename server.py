@@ -82,6 +82,13 @@ def pack_tar(filename: str, content: bytes) -> io.BytesIO:
     return buf
 
 
+def _is_missing_container(exc: docker.errors.NotFound) -> bool:
+    """Docker also answers 404 "No such container" if the container went away
+    (removed or recreated) after get_container(). That is not a path problem, so
+    it goes to the outer "container not found" handler instead."""
+    return "no such container" in str(exc).lower()
+
+
 def _missing_path_error(directory: str, exc: docker.errors.NotFound) -> str:
     """Docker answers put_archive to a missing directory with a 404 (NotFound).
 
@@ -206,6 +213,8 @@ async def call_tool(name: str, arguments: dict) -> list:
             try:
                 container.put_archive(directory, tar)
             except docker.errors.NotFound as exc:
+                if _is_missing_container(exc):
+                    raise
                 return [TextContent(type="text", text=_missing_path_error(directory, exc))]
             log.info("Caddyfile written to %s in container", CADDY_CONTAINER_CONFIG)
             return [TextContent(type="text", text="✓ Caddyfile written. Call caddy_reload to apply.")]
@@ -219,6 +228,8 @@ async def call_tool(name: str, arguments: dict) -> list:
             try:
                 container.put_archive("/tmp", tar)
             except docker.errors.NotFound as exc:
+                if _is_missing_container(exc):
+                    raise
                 return [TextContent(type="text", text=_missing_path_error("/tmp", exc))]
             result = container.exec_run(
                 ["caddy", "validate", "--config", "/tmp/Caddyfile.validate", "--adapter", "caddyfile"],
