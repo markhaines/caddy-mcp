@@ -7,6 +7,16 @@ Reconstructed from git history on 2026-09-08.
 ## Unreleased
 
 ### Fixed
+- **`caddy_read_config` returned `cat`'s error text as if it were the Caddyfile.**
+  `exec_run` does not raise when `cat` fails, and the exit code was never checked. It now
+  returns an `Error:` naming `CADDY_CONTAINER_CONFIG`. (#7)
+- **A missing directory on write or validate was reported as "container not found".**
+  Docker answers `put_archive` to a missing path with a 404, which the blanket `NotFound`
+  handler mislabelled. It now names the path. The `FileNotFoundError` handler, which
+  nothing in the server could reach, is removed, along with the test that faked it. (#7)
+- **Every legacy `/sse` session that ended raised `TypeError` and answered 500.**
+  `handle_sse` returned `None`, which Starlette then called as the response. (#10)
+- README: `caddy_status` returns a start time, not uptime. (#11)
 - **The "Caddyfile not found" handler crashed instead of reporting.** The config variable
   was renamed to `CADDY_CONTAINER_CONFIG` everywhere except the `FileNotFoundError` branch,
   which still referenced `CADDYFILE_PATH`. That branch raised `NameError` from inside the

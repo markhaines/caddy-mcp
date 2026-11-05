@@ -27,7 +27,7 @@ read the Caddyfile, propose a change, **validate it before applying**, and reloa
 | `caddy_validate` | Run Caddy's own config validation |
 | `caddy_reload` | Reload Caddy with the current config |
 | `caddy_get_logs` | Recent container logs |
-| `caddy_status` | Container status, uptime and restart count |
+| `caddy_status` | Container status, start time and restart count |
 
 ## Install
 
